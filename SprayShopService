@@ -1,0 +1,729 @@
+local MarketplaceService = game:GetService("MarketplaceService")
+local Players = game:GetService("Players")
+local MessagingService = game:GetService("MessagingService")
+local DataStoreService = game:GetService("DataStoreService")
+local MemoryStoreService = game:GetService("MemoryStoreService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local HttpService = game:GetService("HttpService")
+
+local SprayData = require(ReplicatedStorage:WaitForChild("Modules"):WaitForChild("SprayData"))
+local Monetization = require(ReplicatedStorage:WaitForChild("Modules"):WaitForChild("Monetization"))
+local cachedModules = require(script.Parent.Parent.Server.CachedModules)
+
+local RemoteEvents = ReplicatedStorage:WaitForChild("RemoteEvents")
+local PurchaseEvent = RemoteEvents:FindFirstChild("Purchase")
+
+local stockMemoryKey = "GLOBAL_SPRAY_STOCK"
+local timeMemoryKey = "GLOBAL_SPRAY_RESTOCK_TIME"
+local restockInterval = 300 
+local RESTOCK_PRODUCT_ID = Monetization.DevProducts.RestockShop
+
+local memoryMap
+do
+	local success, result = pcall(function()
+		return MemoryStoreService:GetSortedMap("GlobalSprayShop")
+	end)
+	if success then
+		memoryMap = result
+	else
+		warn("[SprayShopService] MemoryStoreService unavailable (place not published, or API access disabled) — falling back to DataStore only.")
+		memoryMap = nil
+	end
+end
+
+-- ===== DATASTORE BACKUP WRITER =====
+--
+-- MemoryStoreService is the authoritative store for the shared shop (correct:
+-- the data is server-wide, high-churn and short-lived). The DataStore below is
+-- only a durability backup for when MemoryStore is empty or unavailable.
+--
+-- It used to be written STRAIGHT THROUGH on every mutation, including one
+-- SetAsync per spray purchase, all onto the same two fixed keys. Roblox limits
+-- writes to a single key to roughly one per six seconds; past that they are
+-- throttled and queued, and because the DataStore request budget is shared
+-- server-wide, a busy shop could back up the queue for every OTHER save on the
+-- server -- including player profiles. A purchase remote should never be able
+-- to do that.
+--
+-- Writes are now coalesced: the latest value per key is kept and flushed by a
+-- single background writer no more often than the per-key limit allows. Ten
+-- purchases in a second become one write of the final state, which is the only
+-- state that matters for a backup.
+local BACKUP_STORE_NAME = "GLOBAL_SPRAY_SHOP"
+local BACKUP_MIN_INTERVAL = 7 -- comfortably above Roblox's ~6s per-key limit
+local BACKUP_MAX_ATTEMPTS = 4
+
+local backupStore = nil
+local pendingBackup: {[string]: any} = {}
+local backupWriterRunning = false
+
+local function getBackupStore()
+	if backupStore then return backupStore end
+	local ok, result = pcall(function()
+		return DataStoreService:GetDataStore(BACKUP_STORE_NAME)
+	end)
+	if ok then
+		backupStore = result
+	else
+		warn("[SprayShopService] DataStore backup unavailable: " .. tostring(result))
+	end
+	return backupStore
+end
+
+-- Retries with exponential backoff. A throttled write is a transient condition,
+-- and the previous code's bare pcall discarded the failure silently -- so a
+-- backup could quietly stop updating for hours with nothing in the log.
+local function writeBackupWithBackoff(key: string, value: any): boolean
+	local store = getBackupStore()
+	if not store then return false end
+
+	local waitTime = 1
+	for attempt = 1, BACKUP_MAX_ATTEMPTS do
+		local ok, err = pcall(function()
+			store:SetAsync(key, value)
+		end)
+		if ok then return true end
+
+		if attempt == BACKUP_MAX_ATTEMPTS then
+			warn(("[SprayShopService] backup write to '%s' failed after %d attempts: %s")
+				:format(key, attempt, tostring(err)))
+		else
+			task.wait(waitTime)
+			waitTime *= 2
+		end
+	end
+	return false
+end
+
+local function queueBackupWrite(key: string, value: any)
+	-- Latest value wins: an older pending payload for the same key is superseded,
+	-- never queued behind the newer one.
+	pendingBackup[key] = value
+
+	if backupWriterRunning then return end
+	backupWriterRunning = true
+
+	task.spawn(function()
+		while true do
+			local snapshot = pendingBackup
+			pendingBackup = {}
+
+			for key, value in pairs(snapshot) do
+				writeBackupWithBackoff(key, value)
+			end
+
+			task.wait(BACKUP_MIN_INTERVAL)
+
+			-- Nothing arrived during the cooldown, so the writer can stand down.
+			-- Checked AFTER the wait so a burst that lands mid-cooldown is picked
+			-- up by this same loop rather than starting a second writer.
+			if next(pendingBackup) == nil then
+				backupWriterRunning = false
+				return
+			end
+		end
+	end)
+end
+
+local SprayShopService = {
+	RestockInterval = restockInterval,
+	LastRestockTime = os.time(),
+}
+
+local SETTINGS = {
+	SHOP_SLOTS_RANGE = {Min = 2, Max = 8}, 
+	STOCK_RANGE = {Min = 1, Max = 5}, 
+	RARITY_CHANCE = {
+		Common = 70,
+		Uncommon = 15,
+		Rare = 12,
+		Epic = 3,
+		Legendary = 1,
+	},
+}
+
+-- Mapping DevProduct IDs to Luxury Spray Names dynamically
+local ProductIdToSpray = {}
+local SprayToProductId = {}
+for _, sprayName in ipairs(SprayData.getSprayOrder()) do
+	local sprayDataFolder = SprayData.getData(sprayName)
+	if sprayDataFolder and sprayDataFolder:FindFirstChild("DevProduct") then
+		local devProductId = sprayDataFolder.DevProduct.Value
+		ProductIdToSpray[devProductId] = sprayName
+		SprayToProductId[sprayName] = devProductId
+	end
+end
+
+-- Mapping DevProduct IDs to Coin/Diamond pack definitions dynamically
+local ProductIdToCoinPack = {}
+for packName, packData in pairs(Monetization.Coins) do
+	if packData.ID and packData.ID ~= 0 then
+		ProductIdToCoinPack[packData.ID] = { Name = packName, Amount = packData.Amount }
+	end
+end
+
+local ProductIdToDiamondPack = {}
+for packName, packData in pairs(Monetization.Diamonds) do
+	if packData.ID and packData.ID ~= 0 then
+		ProductIdToDiamondPack[packData.ID] = { Name = packName, Amount = packData.Amount }
+	end
+end
+
+local ProductIdToBundle = {}
+for bundleName, bundleData in pairs(Monetization.Bundles) do
+	if bundleData.ID and bundleData.ID ~= 0 then
+		ProductIdToBundle[bundleData.ID] = { Name = bundleName, Data = bundleData }
+	end
+end
+
+local pendingGifts = {}
+local PENDING_GIFT_TTL = 180
+
+local function FormatTime(seconds)
+	local minutes = math.floor(seconds / 60)
+	local remainder = seconds % 60
+	return string.format("%d:%02d", minutes, remainder)
+end
+
+local function GenerateStock()
+	local sprayStock = {}
+	local sprayOrder = SprayData.getSprayOrder()
+
+	local eligiblePool = {}
+	for _, sprayName in ipairs(sprayOrder) do
+		local folderData = SprayData.getData(sprayName)
+		local rarity = folderData and folderData:FindFirstChild("Rarity") and folderData.Rarity.Value or "Common"
+		local price = folderData and folderData:FindFirstChild("Price") and folderData.Price.Value or 0
+		local layoutOrder = folderData and folderData:FindFirstChild("LayoutOrder") and folderData.LayoutOrder.Value or 0
+
+		sprayStock[sprayName] = {
+			Name = sprayName,
+			StockAmount = 0,
+			Price = price,
+			Rarity = rarity,
+			LayoutOrder = layoutOrder,
+			IsInStock = false
+		}
+
+		if folderData then
+			table.insert(eligiblePool, sprayName)
+		else
+			warn(`[SprayShopService] Missing folder data configurations for: {sprayName}. Slotted defaults.`)
+		end
+	end
+
+	local totalSlotsToFill = math.random(SETTINGS.SHOP_SLOTS_RANGE.Min, SETTINGS.SHOP_SLOTS_RANGE.Max)
+	totalSlotsToFill = math.min(totalSlotsToFill, #eligiblePool)
+
+	local selectedCount = 0
+	local attempts = 0
+
+	while selectedCount < totalSlotsToFill and #eligiblePool > 0 and attempts < 100 do
+		attempts += 1
+
+		local poolIndex = math.random(1, #eligiblePool)
+		local candidateName = eligiblePool[poolIndex]
+		local itemData = sprayStock[candidateName]
+
+		local weight = SETTINGS.RARITY_CHANCE[itemData.Rarity] or 100
+		local roll = math.random(1, 100)
+
+		if roll <= weight then
+			itemData.StockAmount = math.random(SETTINGS.STOCK_RANGE.Min, SETTINGS.STOCK_RANGE.Max)
+			itemData.IsInStock = true
+
+			selectedCount += 1
+			table.remove(eligiblePool, poolIndex)
+		end
+	end
+
+	if selectedCount < SETTINGS.SHOP_SLOTS_RANGE.Min and #eligiblePool > 0 then
+		while selectedCount < SETTINGS.SHOP_SLOTS_RANGE.Min and #eligiblePool > 0 do
+			local poolIndex = math.random(1, #eligiblePool)
+			local candidateName = eligiblePool[poolIndex]
+			local itemData = sprayStock[candidateName]
+
+			itemData.StockAmount = math.random(SETTINGS.STOCK_RANGE.Min, SETTINGS.STOCK_RANGE.Max)
+			itemData.IsInStock = true
+
+			selectedCount += 1
+			table.remove(eligiblePool, poolIndex)
+		end
+	end
+
+	return sprayStock
+end
+
+function SprayShopService:GetCurrentStock()
+	local success, raw = pcall(function()
+		return memoryMap:GetAsync(stockMemoryKey)
+	end)
+	if success and raw then
+		return HttpService:JSONDecode(raw)
+	end
+
+	local backupDataStore = DataStoreService:GetDataStore("GLOBAL_SPRAY_SHOP")
+	local backupSuccess, backupRaw = pcall(function()
+		return backupDataStore:GetAsync(stockMemoryKey)
+	end)
+	if backupSuccess and backupRaw then
+		return HttpService:JSONDecode(backupRaw)
+	end
+	return nil
+end
+
+function SprayShopService:GetTimeUntilRestock()
+	local success, timestamp = pcall(function()
+		return memoryMap:GetAsync(timeMemoryKey)
+	end)
+	if success and timestamp then
+		self.LastRestockTime = timestamp
+	else
+		local backupDataStore = DataStoreService:GetDataStore("GLOBAL_SPRAY_SHOP")
+		pcall(function()
+			local ts = backupDataStore:GetAsync(timeMemoryKey)
+			if ts then self.LastRestockTime = ts end
+		end)
+	end
+	local elapsed = os.time() - self.LastRestockTime
+	return math.max(0, restockInterval - elapsed)
+end
+
+function SprayShopService:SaveStockToMemoryStore(stockData)
+	local jsonData = HttpService:JSONEncode(stockData)
+
+	pcall(function()
+		memoryMap:SetAsync(stockMemoryKey, jsonData, 3600)
+	end)
+
+	queueBackupWrite(stockMemoryKey, jsonData)
+end
+
+function SprayShopService:PurchaseStockTransaction(sprayName, amountToDecrement)
+	local updatedStockData = nil
+
+	local success = pcall(function()
+		memoryMap:UpdateAsync(stockMemoryKey, function(rawJson)
+			if not rawJson then return nil end
+			local currentStock = HttpService:JSONDecode(rawJson)
+
+			if currentStock[sprayName] and currentStock[sprayName].StockAmount >= amountToDecrement then
+				currentStock[sprayName].StockAmount -= amountToDecrement
+				currentStock[sprayName].IsInStock = currentStock[sprayName].StockAmount > 0
+				updatedStockData = currentStock
+				return HttpService:JSONEncode(currentStock)
+			end
+			return nil
+		end, 3600)
+	end)
+
+	if success and updatedStockData then
+		-- THE HOT PATH: one of these per spray purchased, across every server.
+		-- Coalesced rather than written straight through.
+		queueBackupWrite(stockMemoryKey, HttpService:JSONEncode(updatedStockData))
+	end
+
+	return success and updatedStockData ~= nil, updatedStockData
+end
+
+function SprayShopService:SaveRestockTime()
+	local timestamp = os.time()
+
+	pcall(function()
+		memoryMap:SetAsync(timeMemoryKey, timestamp, 3600)
+	end)
+
+	queueBackupWrite(timeMemoryKey, timestamp)
+end
+
+local function publishSafe(topic: string)
+	local ok, err = pcall(function()
+		MessagingService:PublishAsync(topic, true)
+	end)
+	if not ok then
+		warn("[SprayShopService] PublishAsync failed for " .. topic .. ": " .. tostring(err))
+	end
+	return ok
+end
+
+function SprayShopService:BroadcastRestock()
+	local stock = GenerateStock()
+	self:SaveStockToMemoryStore(stock)
+	self:SaveRestockTime()
+	self.LastRestockTime = os.time()
+
+	publishSafe("GlobalSprayShopRestock")
+end
+
+local function HandleDevProductRestock(player)
+	local freshStock = GenerateStock()
+	if freshStock then
+		SprayShopService:SaveStockToMemoryStore(freshStock)
+		SprayShopService:SaveRestockTime()
+		SprayShopService.LastRestockTime = os.time()
+
+		publishSafe("GlobalSprayShopRestock")
+
+		player:SetAttribute("PersonalRestockActive", true)
+	end
+end
+
+local function OnRestockMessage()
+	local stock = SprayShopService:GetCurrentStock()
+	if stock then
+		RemoteEvents.ResetSprayShop:FireAllClients(stock, true)
+	end
+end
+
+local function OnStockUpdateMessage()
+	local stock = SprayShopService:GetCurrentStock()
+	if stock then
+		RemoteEvents.ResetSprayShop:FireAllClients(stock, false)
+	end
+end
+
+function SprayShopService:ForceRestock()
+	self:BroadcastRestock()
+end
+
+local function loadInitialStockForPlayer(player)
+	task.spawn(function()
+		for _ = 1, 15 do
+			local stock = SprayShopService:GetCurrentStock()
+			if stock then
+				RemoteEvents.ResetSprayShop:FireClient(player, stock, false)
+				return
+			end
+			task.wait(1)
+		end
+	end)
+end
+
+local function sendCurrentStock(player)
+	local stock = SprayShopService:GetCurrentStock()
+	if stock then
+		RemoteEvents.ResetSprayShop:FireClient(player, stock, false)
+	end
+end
+
+function SprayShopService.init()
+	MessagingService:SubscribeAsync("GlobalSprayShopRestock", OnRestockMessage)
+	MessagingService:SubscribeAsync("GlobalSprayShopStockUpdate", OnStockUpdateMessage)
+
+	local existingStock = SprayShopService:GetCurrentStock()
+	if not existingStock then
+		local initialStock = GenerateStock()
+		SprayShopService:SaveStockToMemoryStore(initialStock)
+		SprayShopService:SaveRestockTime()
+		SprayShopService.LastRestockTime = os.time()
+	else
+		SprayShopService:GetTimeUntilRestock()
+	end
+
+	MarketplaceService.ProcessReceipt = function(receiptInfo)
+		local player = Players:GetPlayerByUserId(receiptInfo.PlayerId)
+		if not player then
+			return Enum.ProductPurchaseDecision.NotProcessedYet
+		end
+
+		local dataService = cachedModules.Cache.DataService
+		local profileData = dataService and dataService.getData(player)
+		if not profileData then
+			return Enum.ProductPurchaseDecision.NotProcessedYet
+		end
+
+		profileData.PurchaseHistory = profileData.PurchaseHistory or {}
+		if profileData.PurchaseHistory[receiptInfo.PurchaseId] then
+			return Enum.ProductPurchaseDecision.PurchaseGranted
+		end
+
+		local function markGranted()
+			profileData.PurchaseHistory[receiptInfo.PurchaseId] = true
+		end
+
+		local productId = receiptInfo.ProductId
+
+		local coinPack = ProductIdToCoinPack[productId]
+		if coinPack then
+			local moneyService = cachedModules.Cache.MoneyService
+			local success = moneyService and pcall(function()
+				moneyService.grantPurchasedCoins(player, coinPack.Amount)
+			end)
+			if success then
+				markGranted()
+				local clientNotify = cachedModules.Cache.ClientNotifyService
+				if clientNotify then
+					clientNotify.notify(player, "Purchase", `+{coinPack.Amount} Coins ({coinPack.Name})!`)
+				end
+				return Enum.ProductPurchaseDecision.PurchaseGranted
+			else
+				warn("\xE2\x9D\x8C Failed to grant coin pack:", coinPack.Name)
+				return Enum.ProductPurchaseDecision.NotProcessedYet
+			end
+		end
+
+		local diamondPack = ProductIdToDiamondPack[productId]
+		if diamondPack then
+			local moneyService = cachedModules.Cache.MoneyService
+			local success = moneyService and pcall(function()
+				moneyService.giveDiamonds(player, diamondPack.Amount)
+			end)
+			if success then
+				markGranted()
+				local clientNotify = cachedModules.Cache.ClientNotifyService
+				if clientNotify then
+					clientNotify.notify(player, "Purchase", `+{diamondPack.Amount} Diamonds ({diamondPack.Name})!`)
+				end
+				return Enum.ProductPurchaseDecision.PurchaseGranted
+			else
+				warn("\xE2\x9D\x8C Failed to grant diamond pack:", diamondPack.Name)
+				return Enum.ProductPurchaseDecision.NotProcessedYet
+			end
+		end
+
+		local bundle = ProductIdToBundle[productId]
+		if bundle then
+			local inventoryService = cachedModules.Cache.InventoryService
+			local moneyService = cachedModules.Cache.MoneyService
+			local success = pcall(function()
+				for _, item in ipairs(bundle.Data.Items) do
+					for _ = 1, item.Count do
+						inventoryService.giveSpray(player, item.Name, { Mutations = "" })
+					end
+				end
+				if bundle.Data.Coins and bundle.Data.Coins > 0 then
+					moneyService.grantPurchasedCoins(player, bundle.Data.Coins)
+				end
+				if bundle.Data.Diamonds and bundle.Data.Diamonds > 0 then
+					moneyService.giveDiamonds(player, bundle.Data.Diamonds)
+				end
+			end)
+			if success then
+				markGranted()
+				local clientNotify = cachedModules.Cache.ClientNotifyService
+				if clientNotify then
+					clientNotify.notify(player, "Purchase", `{bundle.Name} unlocked!`)
+				end
+				return Enum.ProductPurchaseDecision.PurchaseGranted
+			else
+				warn("\xE2\x9D\x8C Failed to grant bundle:", bundle.Name)
+				return Enum.ProductPurchaseDecision.NotProcessedYet
+			end
+		end
+
+		local sprayName = ProductIdToSpray[productId]
+		if sprayName then
+			
+			local deliverTo = player
+			local isGift = false
+
+			local pending = pendingGifts[player.UserId]
+			if pending and pending.SprayName == sprayName and pending.Expires > os.time() then
+				local recipient = Players:GetPlayerByUserId(pending.TargetUserId)
+				if recipient then
+					deliverTo = recipient
+					isGift = true
+				end
+			end
+			local success, err = pcall(function()
+				local inventoryService = cachedModules.Cache.InventoryService
+				return inventoryService.giveSpray(deliverTo, sprayName, { Mutations = "" })
+			end)
+
+			if success then
+
+				pendingGifts[player.UserId] = nil
+				markGranted()
+				if isGift then
+					local clientNotify = cachedModules.Cache.ClientNotifyService
+					if clientNotify then
+						clientNotify.notify(player, "Purchase", `Gift sent to {deliverTo.DisplayName}!`)
+						clientNotify.notify(deliverTo, "Purchase", `{player.DisplayName} gifted you a {sprayName}!`)
+					end
+				end
+				return Enum.ProductPurchaseDecision.PurchaseGranted
+			else
+				warn("\xE2\x9D\x8C Failed to grant native spray asset:", err)
+				return Enum.ProductPurchaseDecision.NotProcessedYet
+			end
+		end
+
+		if productId == RESTOCK_PRODUCT_ID then
+			markGranted()
+			if PurchaseEvent then
+				PurchaseEvent:FireClient(player)
+			end
+			HandleDevProductRestock(player)
+			return Enum.ProductPurchaseDecision.PurchaseGranted
+		end
+
+		local weatherService = cachedModules.Cache.WeatherService
+		if weatherService then
+			local success, granted = pcall(function()
+				return weatherService.handleRobuxProductPurchase(player, productId)
+			end)
+			if success and granted then
+				markGranted()
+				return Enum.ProductPurchaseDecision.PurchaseGranted
+			end
+		end
+
+		local dailyQuestService = cachedModules.Cache.DailyQuestService
+		if dailyQuestService then
+			local success, granted = pcall(function()
+				return dailyQuestService.handleRobuxProductPurchase(player, productId)
+			end)
+			if success and granted then
+				markGranted()
+				return Enum.ProductPurchaseDecision.PurchaseGranted
+			end
+		end
+
+		return Enum.ProductPurchaseDecision.NotProcessedYet
+	end
+
+	RemoteEvents.BuySpray.OnServerEvent:Connect(function(player, sprayName)
+		local rateLimiter = cachedModules.Cache.RateLimiter
+		if rateLimiter and not rateLimiter.guard(player, "BuySpray", 8, 5) then return end
+
+		local folderData = SprayData.getData(sprayName)
+		if not folderData then return end
+
+		local price = folderData.Price.Value
+		local currencyType = folderData:FindFirstChild("CurrencyType") and folderData.CurrencyType.Value or "Coins"
+
+		local moneyService = cachedModules.Cache.MoneyService
+		local inventoryService = cachedModules.Cache.InventoryService
+
+		if not moneyService or not inventoryService then
+			warn("[SprayShopService] MoneyService or InventoryService are missing from Cache definitions!")
+			return
+		end
+
+		local hasFunds = false
+		if currencyType == "Diamonds" then
+			hasFunds = moneyService.hasEnoughDiamonds(player, price)
+		else
+			hasFunds = moneyService.hasEnoughCoins(player, price)
+		end
+
+		if not hasFunds then
+			warn(`[Purchase Failed] {player.Name} has insufficient local funds for {sprayName}.`)
+			local clientNotify = cachedModules.Cache.ClientNotifyService
+			if clientNotify then
+				clientNotify.notify(player, "Decline", "Not enough " .. currencyType .. " for that spray!")
+			end
+			return
+		end
+
+		local txSuccess, updatedStock = SprayShopService:PurchaseStockTransaction(sprayName, 1)
+
+		if txSuccess and updatedStock then
+			local transactionSuccess = false
+
+			if currencyType == "Diamonds" then
+				transactionSuccess = moneyService.removeDiamonds(player, price)
+			else
+				transactionSuccess = moneyService.removeCoins(player, price)
+			end
+
+			if transactionSuccess then
+	
+				local granted = pcall(function()
+					inventoryService.giveSpray(player, sprayName, { Mutations = "" })
+				end)
+
+				if not granted then
+					warn(`[Purchase Critical Fail] Grant failed for {player.Name} after payment. Refunding and reverting stock.`)
+					if currencyType == "Diamonds" then
+						moneyService.giveDiamonds(player, price)
+					else
+						moneyService.refundCoins(player, price)
+					end
+					SprayShopService:PurchaseStockTransaction(sprayName, -1)
+
+					local clientNotify = cachedModules.Cache.ClientNotifyService
+					if clientNotify then
+						clientNotify.notify(player, "Decline", "Purchase failed -- you've been refunded.")
+					end
+					return
+				end
+
+				RemoteEvents.ResetSprayShop:FireAllClients(updatedStock, false)
+				publishSafe("GlobalSprayShopStockUpdate")
+			else
+				warn(`[Purchase Critical Fail] Currency deduction failed for {player.Name}. Reverting global stock block.`)
+				SprayShopService:PurchaseStockTransaction(sprayName, -1)
+			end
+		else
+			warn(`[Purchase Failed] {player.Name} tried buying {sprayName} but it sold out in another server transaction.`)
+			local clientNotify = cachedModules.Cache.ClientNotifyService
+			if clientNotify then
+				clientNotify.notify(player, "Decline", "That spray just sold out!")
+			end
+		end
+	end)
+
+	RemoteEvents.GiftSpray.OnServerEvent:Connect(function(player, sprayName, targetUserId)
+		local rateLimiter = cachedModules.Cache.RateLimiter
+		if rateLimiter and not rateLimiter.guard(player, "GiftSpray", 6, 5) then return end
+
+		if typeof(sprayName) ~= "string" or typeof(targetUserId) ~= "number" then return end
+
+		local clientNotify = cachedModules.Cache.ClientNotifyService
+
+		if targetUserId == player.UserId then
+			if clientNotify then clientNotify.notify(player, "Decline", "You can't gift yourself!") end
+			return
+		end
+
+		local targetPlayer = Players:GetPlayerByUserId(targetUserId)
+		if not targetPlayer then
+			if clientNotify then clientNotify.notify(player, "Decline", "That player isn't in the server anymore.") end
+			return
+		end
+
+		if not SprayToProductId[sprayName] then
+			return
+		end
+
+		pendingGifts[player.UserId] = {
+			TargetUserId = targetUserId,
+			SprayName = sprayName,
+			Expires = os.time() + PENDING_GIFT_TTL,
+		}
+	end)
+
+	Players.PlayerRemoving:Connect(function(leavingPlayer)
+		pendingGifts[leavingPlayer.UserId] = nil
+	end)
+
+	task.spawn(function()
+		while true do
+			local remaining = SprayShopService:GetTimeUntilRestock()
+			while remaining > 0 do
+				RemoteEvents.SprayShopTimer:FireAllClients(FormatTime(remaining))
+				task.wait(1)
+				local elapsed = os.time() - SprayShopService.LastRestockTime
+				remaining = math.max(0, restockInterval - elapsed)
+			end
+			SprayShopService:BroadcastRestock()
+		end
+	end)
+
+	RemoteEvents.RequestSprayShopStock.OnServerEvent:Connect(function(player)
+
+		local rateLimiter = cachedModules.Cache.RateLimiter
+		if rateLimiter and not rateLimiter.guard(player, "RequestSprayShopStock", 5, 5) then return end
+
+		sendCurrentStock(player)
+	end)
+
+	for _, player in ipairs(Players:GetPlayers()) do
+		loadInitialStockForPlayer(player)
+	end
+
+	Players.PlayerAdded:Connect(loadInitialStockForPlayer)
+end
+
+return SprayShopService
