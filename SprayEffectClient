@@ -1,0 +1,139 @@
+ local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local CollectionService = game:GetService("CollectionService")
+
+local Modules = ReplicatedStorage:WaitForChild("Modules")
+local MutationsFolder = Modules:WaitForChild("Mutations")
+
+-- Garment visibility used to live in this file (updateVisualStock, below) and
+-- fought RackCategoryService for control of Part.Transparency. It now lives in
+-- exactly one place; this script keeps only the mutation/spray VFX half and
+-- hands rack setup through to the controller.
+local RackDisplayController = require(script.Parent:WaitForChild("Modules"):WaitForChild("RackDisplayController"))
+local RackCategoryConfig = require(Modules:WaitForChild("RackCategoryConfig"))
+
+local mutationModules = {}
+
+local function preLoadMutationModules()
+	for _, child in ipairs(MutationsFolder:GetChildren()) do
+		if child:IsA("ModuleScript") then
+			local childCleanName = string.gsub(child.Name, " ", "")
+			if not mutationModules[childCleanName] then
+				mutationModules[childCleanName] = require(child)
+			end
+		end
+	end
+end
+
+local function getMutationModule(effectName)
+	local cleanName = string.gsub(effectName, " ", "")
+	if mutationModules[cleanName] then return mutationModules[cleanName] end
+
+	local target = MutationsFolder:FindFirstChild(effectName)
+	if target and target:IsA("ModuleScript") then
+		mutationModules[cleanName] = require(target)
+		return mutationModules[cleanName]
+	end
+
+	return nil
+end
+
+local SprayEffectClient = {}
+
+local function handleRackEffect(rack: Instance)
+	local currentEffect = rack:GetAttribute("SprayEffect")
+	if currentEffect == nil then return end 
+
+	for _, module in pairs(mutationModules) do
+		if module.removeEffect then
+			pcall(function()
+				module.removeEffect(rack)
+			end)
+		end
+	end
+
+	if currentEffect == "None" or currentEffect == "Water Spray" then
+		return
+	end
+
+	local targetModule = getMutationModule(currentEffect)
+	if targetModule and targetModule.applyEffect then
+		targetModule.applyEffect(rack)
+	else
+		warn(`Visual module script layout not found for effect name: {currentEffect}`)
+	end
+end
+
+-- OutfitMannequin displays don't have a DisplayItems folder at all -- their
+-- outfit visibility is handled entirely by OutfitMannequinService (Shirt/
+-- Pants/Accessory toggling), not by the Transparency-based stock reveal. Skip
+-- that half for them so this doesn't fight OutfitMannequinService or spam the
+-- "missing DisplayItems folder" warning every restock/sale.
+local setupRacks: {[Instance]: boolean} = {}
+
+local function setupRack(rack: Instance)
+	-- The prefabs in ReplicatedStorage carry the same tags as their placed
+	-- copies, so a naive GetTagged sweep sets up the templates too. Harmless but
+	-- pointless: the client's copy of ReplicatedStorage is never what gets
+	-- cloned, and hiding garments in there just burns frames.
+	if not rack:IsDescendantOf(workspace) then return end
+	if setupRacks[rack] then return end
+	setupRacks[rack] = true
+
+	local isMannequin = CollectionService:HasTag(rack, "OutfitMannequin")
+
+	if not isMannequin then
+		local displayFolder = rack:WaitForChild("DisplayItems", 5)
+		if displayFolder then
+			-- Nothing adds garments at runtime today, but a repaint/re-clone that
+			-- did would arrive already visible (the prefab's authored
+			-- transparency), so re-derive instantly rather than animate.
+			displayFolder.DescendantAdded:Connect(function()
+				task.defer(function()
+					if rack.Parent then
+						RackDisplayController.refresh(rack, false)
+					end
+				end)
+			end)
+
+			RackDisplayController.attach(rack)
+		else
+			warn(`{rack.Name} is missing 'DisplayItems' folder!`)
+		end
+	end
+
+	-- Mutation VFX (handleRackEffect -> BaseMutationController) applies equally
+	-- to both -- it just needs a VFXAttachment somewhere in the model, which
+	-- mannequins now have (see OutfitMannequinService/the rig's VFXAttachment).
+	rack:GetAttributeChangedSignal("SprayEffect"):Connect(function()
+		handleRackEffect(rack)
+	end)
+
+	handleRackEffect(rack)
+end
+
+function SprayEffectClient.init()
+	preLoadMutationModules()
+
+	-- DisplayRack was missing here. Accessory displays (Shoes / Bags / Hats) are
+	-- tagged DisplayRack, not RetailRack, so they were never wired to any client
+	-- visibility logic at all -- their entire reveal depended on the server
+	-- painting Transparency, which is exactly the double-writer arrangement that
+	-- produced the overlap glitch on clothing racks. Driving every rack tag
+	-- through the same controller means shoes/bags/hats get the same debounce,
+	-- the same hard clear and the same staggered reveal as shirts/pants.
+	local tags = { "OutfitMannequin" }
+	for tagName in pairs(RackCategoryConfig) do
+		table.insert(tags, tagName)
+	end
+
+	for _, tagName in ipairs(tags) do
+		CollectionService:GetInstanceAddedSignal(tagName):Connect(setupRack)
+		for _, rack in ipairs(CollectionService:GetTagged(tagName)) do
+			task.spawn(setupRack, rack)
+		end
+	end
+end
+
+SprayEffectClient.init()
+
+return SprayEffectClient
