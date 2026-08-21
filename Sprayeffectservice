@@ -1,0 +1,91 @@
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
+
+local modules = ReplicatedStorage:WaitForChild("Modules")
+local SprayData = require(modules:WaitForChild("SprayData"))
+local cachedModules = require(script.Parent.Parent.Server.CachedModules)
+
+local SprayEffectService = {}
+
+local SPRAY_MULTIPLIERS = {
+	["None"] = 1.0,
+	["Water Spray"] = 1.0, 
+	["Dew Drop Spray"] = 1.2,
+	["Velvet Suede Spray"] = 1.5,
+	["Retro Neon Spray"] = 2.0,
+	["Chameleon Spray"] = 2.5,
+	["Liquid Chrome Spray"] = 3.0,
+	["Glitch Spray"] = 4.5,
+	["Cosmic Spray"] = 5.0,
+	["Vamp Era Spray"] = 6.0,
+	["Eclipse Mutation"] = 7.0,
+	["Circuit Mutation"] = 8.0,
+	["Frost Mutation"] = 9.0,
+	["Runway Mutation"] = 10.0,
+}
+
+function SprayEffectService.setSprayEffect(rack: Instance, sprayName: string, player: Player)
+	if not rack then 
+		warn("Cannot apply spray")
+		return false
+	end
+
+	-- Clean up any accidentally trailing whitespaces from names
+	if sprayName then
+		sprayName = string.match(sprayName, "^%s*(.-)%s*$")
+	end
+
+	-- 1. Check for Water Spray first to clear mutations unconditionally
+	if sprayName == "Water Spray" then
+		rack:SetAttribute("SprayEffect", "None")
+		return true
+	end
+
+	local currentEffect = rack:GetAttribute("SprayEffect") or "None"
+
+	-- 2. Prevent spraying a mutation on top of another existing mutation
+	if currentEffect ~= "None" then
+		local RemoteEvents = ReplicatedStorage:FindFirstChild("RemoteEvents")
+		local sprayWarningEvent = RemoteEvents and RemoteEvents:FindFirstChild("SprayWarning")
+		if sprayWarningEvent and player then
+			sprayWarningEvent:FireClient(player, "Mutation already on rack! Grab a water spray!")
+		end
+		return false
+	end
+
+	if not sprayName or sprayName == "" or sprayName == "None" then
+		rack:SetAttribute("SprayEffect", "None")
+		return true
+	end
+
+	-- 3. Apply the valid base mutation
+	if SPRAY_MULTIPLIERS[sprayName] then
+		rack:SetAttribute("SprayEffect", sprayName)
+		return true
+	else
+		warn("Attempted to apply unrecognized spray effect name: " .. tostring(sprayName))
+		return false
+	end
+end
+
+function SprayEffectService.getSprayEffect(rack: Instance): string
+	if not rack then return "None" end
+	return rack:GetAttribute("SprayEffect") or "None"
+end
+
+function SprayEffectService.getMultiplier(rack: Instance): number
+	if not rack then return 1.0 end
+	local currentEffect = rack:GetAttribute("SprayEffect") or "None"
+	return SPRAY_MULTIPLIERS[currentEffect] or 1.0
+end
+
+function SprayEffectService.clearSprayEffect(rack: Instance)
+	if rack then
+		rack:SetAttribute("SprayEffect", "None")
+	end
+end
+
+function SprayEffectService.init()
+end
+
+return SprayEffectService
