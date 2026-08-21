@@ -1,0 +1,340 @@
+  local CollectionService = game:GetService("CollectionService")
+local Players = game:GetService("Players")
+local ProximityPromptService = game:GetService("ProximityPromptService") 
+
+local cachedModules = require(game.ServerScriptService.Server.CachedModules)
+
+local RackInteractionService = {}
+
+-- ITEM #6: which action a prompt represents used to be read as
+-- `prompt.Parent.Name`, which only worked while every prompt was parented to a
+-- BasePart named after its action. Now that prompts live inside the rack's
+-- interaction Attachment, the prompt itself carries the identity (it is renamed
+-- to match during migration) and the ancestor walk stays as the fallback for
+-- any rack still in the old shape.
+local ACTION_NAMES = {
+	RetailSprayPrompt = "RetailSprayPrompt",
+	RetailRestockPrompt = "RetailRestockPrompt",
+}
+
+local function resolvePromptAction(prompt: Instance): string?
+	if ACTION_NAMES[prompt.Name] then return prompt.Name end
+
+	local node: Instance? = prompt.Parent
+	local depth = 0
+	while node and depth < 4 do
+		if ACTION_NAMES[node.Name] then return node.Name end
+		node = node.Parent
+		depth += 1
+	end
+	return nil
+end
+
+local function onPromptTriggered(prompt, player)
+	-- ProximityPrompt triggers are driven by an internal Roblox remote that a
+	-- modified client can fire directly, bypassing the normal hold-duration/
+	-- cooldown UI entirely -- so this needs the same server-side throttle as any
+	-- other remote-driven action (restocking/spraying both touch DataStores via
+	-- MoneyService/PlotService, so a flood here is a real server-lag risk).
+	local rateLimiter = cachedModules.Cache.RateLimiter
+	if rateLimiter and not rateLimiter.guard(player, "RackPrompt", 10, 3) then return end
+
+	local character = player.Character
+	if not character then return end
+
+	-- 🛠️ DYNAMIC SERVICE LOOKUP
+	local inventoryService = cachedModules.Cache.InventoryService
+	local sprayEffectService = cachedModules.Cache.SprayEffectService
+	local moneyService = cachedModules.Cache.MoneyService
+
+	if not inventoryService or not sprayEffectService then
+		warn("⚠️ Core gameplay services are still initializing in CachedModules!")
+		return
+	end
+
+	-- Walk up the hierarchy to find the tagged rack/display model.
+	-- OutfitMannequin (see OutfitMannequinService) shares both the restock AND
+	-- spray flows with RetailRack now that mannequins carry their own
+	-- VFXAttachment for BaseMutationController to spawn mutation VFX on.
+	local rackModel = prompt
+	while rackModel and not (CollectionService:HasTag(rackModel, "RetailRack") or CollectionService:HasTag(rackModel, "OutfitMannequin")) do
+		rackModel = rackModel.Parent
+		if rackModel == game or rackModel == workspace then return end
+	end
+	if not rackModel then return end
+
+	-- Resolve the action BEFORE doing any work, so an unrelated prompt (a door,
+	-- a shop kiosk) that happens to sit under a tagged model exits immediately
+	-- rather than falling through the permission check and both branches.
+	local promptPartName = resolvePromptAction(prompt)
+	if not promptPartName then return end
+
+	-- Plot ownership/permission security block. Used to be a strict
+	-- USERID-only match, which silently rejected every rack interaction
+	-- (spray AND restock) from a friend the owner had explicitly granted
+	-- Work/WorkBuild permission via the Hire Friends UI -- their attempts
+	-- were logged as [Security Warning] intrusions instead of working. The
+	-- RetailRestockPrompt branch below already had its own canWork() fallback,
+	-- but this block ran first and returned before that check was ever
+	-- reached, so it was dead code. Checking canWork() here instead restores
+	-- the intended behavior for both spray and restock.
+	-- ITEM #7: one authoritative permission gate for BOTH branches.
+	--
+	-- This used to be a hand-rolled USERID comparison here plus a SECOND,
+	-- subtly different hand-rolled check inside the restock branch -- and the
+	-- restock one was dead code, because this block ran first and returned.
+	-- Routing both through PlotService.checkInstancePermission means the rule
+	-- lives in exactly one place and cannot drift between the two actions again.
+	local plotService = cachedModules.Cache.PlotService
+	if not plotService then
+		-- Fail closed while services initialise: a prompt that briefly does
+		-- nothing beats a prompt anyone can use on anyone's store.
+		return
+	end
+
+	local allowed, plot = plotService.checkInstancePermission(player, rackModel, false)
+	if not allowed then
+		local clientNotify = cachedModules.Cache.ClientNotifyService
+		if clientNotify then
+			clientNotify.notify(player, "Decline", "You don't have permission to work in this store!")
+		end
+		return
+	end
+
+	-- ITEM #10: who the store's books belong to.
+	--
+	-- A guest working someone else's shop is spending and saving on the OWNER's
+	-- behalf, not their own. Two bugs came out of conflating the two:
+	--
+	--   * savePlotState(player) resolves the plot by the PASSED player's USERID,
+	--     so a guest restocking wrote the GUEST's own (untouched) plot and left
+	--     the owner's new stock unsaved -- it survived only until the owner next
+	--     saved for some other reason, and was lost outright on a server restart.
+	--   * the restock cost came out of the guest's wallet while every coin of the
+	--     resulting sale went to the owner.
+	--
+	-- Falls back to the acting player only when the plot has no resolvable owner
+	-- (their own plot, or an unowned display), which is the pre-existing
+	-- single-player behaviour.
+	local owner = (plot and plotService.getOwner and plotService.getOwner(plot)) or player
+	local isGuest = owner ~= player
+
+	-- ==========================================
+	-- HANDLE SPRAY ACTION
+	-- ==========================================
+	if promptPartName == "RetailSprayPrompt" then
+		local validSprayTool = nil
+
+		-- Attribute-only lookup: a tool only counts as a spray bottle if it
+		-- carries the authoritative isSpray/sprayID attributes (set server-side
+		-- by InventoryService when a spray is granted). This used to also match
+		-- on the tool's Name containing "spray" or "bottle" as a fallback --
+		-- harmless today since Roblox's replication model doesn't let a client
+		-- inject fake Tools into their own server-side Backpack, but it meant
+		-- any *legitimate* future tool named e.g. "Water Bottle" or "Spray Paint"
+		-- would silently qualify as a working spray bottle too. Attributes only.
+		local function isValidSpray(tool)
+			if not tool:IsA("Tool") then return false end
+			local isSprayAttr = tool:GetAttribute("isSpray") == true or tool:GetAttribute("IsSpray") == true
+			local hasSprayId = tool:GetAttribute("sprayID") ~= nil
+
+			return isSprayAttr or hasSprayId
+		end
+
+		-- 1. Check Character first (actively equipped)
+		for _, tool in character:GetChildren() do
+			if isValidSpray(tool) then
+				validSprayTool = tool
+				break
+			end
+		end
+
+		-- 2. No Backpack fallback. The client only shows RetailSprayPrompt when a
+		-- spray is actually equipped in the player's hand, so accepting a spray
+		-- that is merely sitting in the Backpack meant the server would honour a
+		-- trigger the UI never offered -- which is exactly the state a modified
+		-- client fires directly. Equipped-only keeps both sides on the same rule.
+
+		-- 3. Final Gate & Verbose Debugging Dump
+		if not validSprayTool then
+			warn(`❌ Player {player.Name} does not have a spray bottle equipped!`)
+			local clientNotify = cachedModules.Cache.ClientNotifyService
+			if clientNotify then
+				clientNotify.notify(player, "Decline", "Equip a spray bottle first!")
+			end
+			return
+		end
+
+		-- Grab the persistent name or standard tool name cleanly
+		local sprayID = validSprayTool:GetAttribute("sprayID")
+		local rawSprayName = validSprayTool:GetAttribute("SprayName") or validSprayTool:GetAttribute("Name") or validSprayTool.Name
+
+		-- Strip trailing usage counter (e.g. "Water Spray (3 Uses)") so name comparisons in SprayEffectService succeed
+		local sprayName = string.gsub(rawSprayName, "%s*%([0-9]+%s*[Uu]ses%)", "")
+
+		-- Verify remaining uses from the existing UsesLeft attribute on the spray tool
+		local remainingUses = validSprayTool:GetAttribute("UsesLeft") or 5
+		if remainingUses <= 0 then 
+			print("⚠️ This spray bottle is completely empty!")
+			return 
+		end
+
+		-- Already-mutated racks only accept Water Spray (setSprayEffect refuses to
+		-- stack mutations and notifies the player). Checked before the uses gate so
+		-- a rejected spray never costs the player a charge.
+		local currentEffect = rackModel:GetAttribute("SprayEffect")
+		local rackIsMutated = currentEffect ~= nil and currentEffect ~= "" and currentEffect ~= "None"
+		if rackIsMutated and sprayName ~= "Water Spray" then
+			local clientNotify = cachedModules.Cache.ClientNotifyService
+			if clientNotify then
+				clientNotify.notify(player, "Decline", "Mutation already on rack! Grab a water spray!")
+			end
+			return
+		end
+		if not rackIsMutated and sprayName == "Water Spray" then
+			-- Nothing to wash off; don't burn a use setting "None" to "None".
+			return
+		end
+
+		-- Apply the spray effect using the clean name
+		local success = sprayEffectService.setSprayEffect(rackModel, sprayName, player)
+		if not success then return end
+
+		-- Progression: only real mutations count, not the Water Spray utility
+		if sprayName ~= "Water Spray" and sprayName ~= "None" then
+			local progressService = cachedModules.Cache.ProgressService
+			if progressService then
+				progressService.report(player, "ApplyMutation", 1)
+			end
+		end
+
+		if plotService.savePlotState then
+			plotService.savePlotState(owner)
+		end
+
+		-- Decrement uses on the UsesLeft attribute
+		remainingUses -= 1
+		validSprayTool:SetAttribute("UsesLeft", remainingUses)
+
+		if remainingUses <= 0 then
+			print("💥 Spray empty! Removing asset from inventory pipeline...")
+			inventoryService.removeItem(player, sprayID, 1)
+		end
+
+	elseif promptPartName == "RetailRestockPrompt" then
+		-- Permission was already established above for both branches; the
+		-- duplicate check that used to live here has been removed rather than
+		-- kept in sync.
+		local maxSlots = rackModel:GetAttribute("MaxSlots") or 5
+		local currentStock = rackModel:GetAttribute("CurrentStock")
+		if currentStock == nil then currentStock = rackModel:GetAttribute("StockAmount") end
+
+		if currentStock == nil then return end
+
+		-- Refuse while a restock or category switch is still animating. This is
+		-- the same IsRestocking lock the category cycle takes, checked here BEFORE
+		-- any money moves so a mashed prompt can never charge twice for one fill
+		-- or start a second staggered reveal on top of a running one.
+		local rackCategoryService = cachedModules.Cache.RackCategoryService
+		if rackCategoryService and rackCategoryService.isRestocking(rackModel) then return end
+
+		local costPerItem = rackModel:GetAttribute("RestockCostPerItem") or 0
+
+		if currentStock >= maxSlots then return end
+
+		local emptySlots = maxSlots - currentStock
+		local restockDiscountPercent = workspace:GetAttribute("Weather_restockDiscountPercent") or 0
+	local totalRestockCost = math.floor(emptySlots * costPerItem * (1 - restockDiscountPercent / 100))
+
+		-- Stock is the store's expense, so it is charged to the store's owner.
+		if moneyService and moneyService.removeCoins(owner, totalRestockCost) then
+			rackModel:SetAttribute("CurrentStock", maxSlots)
+			rackModel:SetAttribute("StockAmount", maxSlots) 
+
+			-- Keep the active category's remembered stock in sync so switching
+			-- away and back doesn't lose what was just restocked.
+			local category = rackModel:GetAttribute("Category")
+			if category then rackModel:SetAttribute("CategoryStock_" .. category, maxSlots) end
+
+			-- Takes the lock and bumps DisplaySequence so the clients play the
+			-- staggered pop-in. Set after the stock attributes, never before, so a
+			-- client reacting to the bump reads the finished state.
+			if rackCategoryService and rackCategoryService.markRestocked then
+				rackCategoryService.markRestocked(rackModel)
+			end
+
+			if plotService.savePlotState then
+				plotService.savePlotState(owner)
+			end
+
+			local clientNotify = cachedModules.Cache.ClientNotifyService
+			if clientNotify then
+				clientNotify.notify(player, "Restock", "Rack restocked!")
+				-- Tell the owner too, so money leaving their balance while they are
+				-- stood elsewhere in their shop isn't unexplained.
+				if isGuest and totalRestockCost > 0 then
+					clientNotify.notify(owner, "Restock", player.Name .. " restocked a rack in your store.")
+				end
+			end
+
+			-- New tracked event so quests/milestones can reward the restocking
+			-- loop itself, which is the core upkeep action of the game and
+			-- previously earned no progression credit at all.
+			local progressService = cachedModules.Cache.ProgressService
+			if progressService then
+				progressService.report(player, "RackRestocked", 1)
+			end
+
+			print(`[Restock Success] {player.Name} filled {rackModel.Name} for {totalRestockCost} Coins.`)
+		else
+			local clientNotify = cachedModules.Cache.ClientNotifyService
+			if clientNotify then
+				clientNotify.notify(player, "Decline", isGuest
+					and "The store owner can't afford this restock!"
+					or "Not enough coins to restock!")
+			end
+		end
+	end
+end
+
+local function trackRackStockState(rack: Model)
+	local function verifyStockState()
+		local currentStock = rack:GetAttribute("CurrentStock")
+		if currentStock == nil then currentStock = rack:GetAttribute("StockAmount") end
+
+		if currentStock == nil then return end
+
+		local isStocked = currentStock > 0
+		local isEmpty = currentStock <= 0
+
+		rack:SetAttribute("IsStocked", isStocked)
+		rack:SetAttribute("IsEmpty", isEmpty)
+
+		-- A three-deep InteractionPart -> OutofstockPart -> OutofstockGUI lookup
+		-- used to live here. None of those middle instances has ever existed on any
+		-- rack in this place (a search for OutofstockPart / OutofstockGUI across
+		-- Workspace, ReplicatedStorage and ServerStorage returns zero), so the
+		-- BillboardGui toggle at the bottom was unreachable. InteractionPart itself
+		-- has since been removed entirely -- the rack's billboards and prompts now
+		-- share one InteractionPoint Attachment.
+		--
+		-- The IsStocked / IsEmpty attributes above are the real output of this
+		-- function: RackBBGuiController renders the stock state from them, and
+		-- RackPromptController gates the restock prompt on them.
+	end
+
+	rack:GetAttributeChangedSignal("CurrentStock"):Connect(verifyStockState)
+	rack:GetAttributeChangedSignal("StockAmount"):Connect(verifyStockState)
+	verifyStockState()
+end
+
+function RackInteractionService.init()
+	ProximityPromptService.PromptTriggered:Connect(onPromptTriggered)
+
+	CollectionService:GetInstanceAddedSignal("RetailRack"):Connect(trackRackStockState)
+	for _, rack in ipairs(CollectionService:GetTagged("RetailRack")) do
+		task.spawn(trackRackStockState, rack)
+	end
+end
+
+return RackInteractionService
