@@ -1,0 +1,1810 @@
+local servicesFolder = script.Parent.Services
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local CollectionService = game:GetService("CollectionService")
+local Players = game:GetService("Players")
+local MarketplaceService = game:GetService("MarketplaceService")
+
+local GamepassConfig = require(ReplicatedStorage.Modules.GamepassConfig)
+local RegisterLimitConfig = require(ReplicatedStorage.Modules.RegisterLimitConfig)
+local ColorZoneUtils = require(ReplicatedStorage.Modules.ColorZoneUtils)
+local PlacementTypeConfig = require(ReplicatedStorage.Modules.PlacementTypeConfig)
+local Validation = require(ReplicatedStorage.BuildMode.Modules.Validation)
+local InteractionMarkers = require(ReplicatedStorage.Modules.InteractionMarkers)
+local BuildSettings = require(ReplicatedStorage.BuildMode.Settings)
+
+local StartTime = os.clock()
+
+local cachedModules = {}
+
+for _, moduleScript: ModuleScript in servicesFolder:GetChildren() do
+	if moduleScript:IsA("ModuleScript") then
+		local ok, result = pcall(require, moduleScript)
+		if ok then
+			cachedModules[moduleScript.Name] = result
+		else
+			warn("[Server] Failed to require service '" .. moduleScript.Name .. "': " .. tostring(result))
+		end
+	end
+end
+
+local requiredModule = require(script.CachedModules) 
+requiredModule.Cache = cachedModules
+
+
+for moduleName, moduleScript in cachedModules do
+	moduleScript.cachedModules = cachedModules
+end
+
+for moduleName, moduleScript in cachedModules do
+	if typeof(moduleScript.init) == "function" then
+		local ok, err = pcall(moduleScript.init)
+		if not ok then
+			warn("[Server] Failed to init service '" .. moduleName .. "': " .. tostring(err))
+		end
+	end
+end
+
+local function getOwnedPlot(player: Player): Model?
+	for _, plot in ipairs(workspace.Plots:GetChildren()) do
+		if plot:IsA("Model") and plot:GetAttribute("USERID") == player.UserId then
+			return plot
+		end
+	end
+	return nil
+end
+
+ReplicatedStorage.RemoteEvents.Teleport.OnServerEvent:Connect(function(plr, destinationKey)
+	if not cachedModules.RateLimiter or not cachedModules.RateLimiter.guard(plr, "Teleport", 6, 5) then return end
+	if typeof(destinationKey) ~= "string" then return end
+
+	local character = plr.Character
+	local hrp = character and character:FindFirstChild("HumanoidRootPart")
+	if not hrp then return end
+
+	local targetPart: BasePart? = nil
+
+	if destinationKey == "Shop" then
+		local shop = workspace:FindFirstChild("Shop")
+		targetPart = shop and shop:FindFirstChild("SpawnLocation") :: BasePart?
+	elseif destinationKey == "Home" then
+		local plot = getOwnedPlot(plr)
+		targetPart = plot and plot:FindFirstChild("SpawnLocation") :: BasePart?
+	end
+
+	if not targetPart or not targetPart:IsA("BasePart") then return end
+
+	hrp.CFrame = targetPart.CFrame + Vector3.new(0, 3, 0)
+end)
+
+local buildIdCounter = 1
+
+-- ITEM #11/#12: identifies all placements produced by ONE drag, so the client's
+-- undo stack can group them into a single atomic entry (and the paint/delete
+-- tools can address the whole patch). Server-assigned rather than client-timed:
+-- PlacementResult events replicate individually and can interleave with an
+-- unrelated placement, so "arrived close together" is not a safe grouping key.
+local batchIdCounter = 0
+local function nextBatchId(): string
+	batchIdCounter += 1
+	return "batch#" .. tostring(batchIdCounter)
+end
+local trashStore: {[number]: {Name: string, CF: CFrame, Attributes: {[string]: any}}} = {}
+
+-- ITEM #5: the No-Collision / Overlap-Allowed toggle.
+--
+-- This flag has always existed CLIENT-side: BuildActions sets
+-- `Settings.CanOverlapWithOtherParts`, and Validation honours it, so the
+-- preview stops showing red. But Settings is a ModuleScript, and the server
+-- holds its OWN copy of it whose flag nobody ever set -- so the server kept
+-- running the full overlap test and rejecting every placement the client had
+-- just shown as legal. That is the whole "the button lights up green but I
+-- still can't place anything" bug.
+--
+-- Tracked per player here (a ModuleScript flag on the server would be shared
+-- by everyone on the shard -- one player toggling it would disable overlap
+-- validation for the entire server) and threaded explicitly into
+-- validatePlacementServerSide.
+--
+-- The PLOT BOUNDARY CLAMP is deliberately NOT part of this: bypassing overlap
+-- lets you put a rack through a wall, never outside your own land.
+local collisionDisabled: {[Player]: boolean} = {}
+
+local function overlapBypassed(player: Player): boolean
+	return collisionDisabled[player] == true
+end
+
+local function findBuildAsset(objectName: string): Instance?
+	local buildMode = ReplicatedStorage:FindFirstChild("BuildMode")
+	local assets = buildMode and buildMode:FindFirstChild("Assets")
+	if not assets then return nil end
+	for _, folder in assets:GetChildren() do
+		if folder:IsA("Folder") then
+			local object = folder:FindFirstChild(objectName)
+			if object then return object end
+		end
+	end
+	return nil
+end
+
+local function getRepresentativePart(asset: Instance): BasePart?
+	if asset:IsA("BasePart") then
+		return asset
+	elseif asset:IsA("Model") then
+		return asset.PrimaryPart or asset:FindFirstChildWhichIsA("BasePart", true)
+	end
+	return nil
+end
+
+local function isWithinPlotBounds(plot: Model, position: Vector3, marginStuds: number?): boolean
+	local base = plot:FindFirstChild("Base")
+	if not base or not base:IsA("BasePart") then return false end
+	local margin = marginStuds or 0
+	local halfExtents = Vector3.new(base.Size.X / 2 + margin, base.Size.Y / 2 + 1000, base.Size.Z / 2 + margin)
+	local localPos = base.CFrame:PointToObjectSpace(position)
+	return math.abs(localPos.X) <= halfExtents.X
+		and math.abs(localPos.Y) <= halfExtents.Y
+		and math.abs(localPos.Z) <= halfExtents.Z
+end
+
+local function isWithinOwnedLand(plot: Model, position: Vector3): boolean
+	local bounds = plot:FindFirstChild("PlotBounds")
+	if not bounds or not bounds:IsA("BasePart") then return true end -- fail open if not set up yet
+	local halfExtents = Vector3.new(bounds.Size.X / 2, bounds.Size.Y / 2 + 1000, bounds.Size.Z / 2)
+	local localPos = bounds.CFrame:PointToObjectSpace(position)
+	return math.abs(localPos.X) <= halfExtents.X
+		and math.abs(localPos.Y) <= halfExtents.Y
+		and math.abs(localPos.Z) <= halfExtents.Z
+end
+
+local function checkOwnedLand(player: Player, plot: Model, position: Vector3): boolean
+	if isWithinOwnedLand(plot, position) then return true end
+	local clientNotify = cachedModules.ClientNotifyService
+	if clientNotify then
+		clientNotify.notify(player, "Decline", "Buy more land!")
+	end
+	return false
+end
+
+-- ITEM #10: SERVER-SIDE BUILD TARGET RESOLUTION.
+--
+-- Every build remote resolves the plot it is about to mutate through here.
+--
+-- `requestedPlot` is the client's stated intent (Build Mode tells the server
+-- which plot it opened against). It is treated as a HINT and nothing more: it
+-- is accepted only when it is a real plot AND the server independently agrees
+-- the player may build on it. A client that lies gets its own resolution
+-- instead, never an error it could use to probe.
+--
+-- Returning nil means "this player may not build anywhere right now", and every
+-- caller must treat that as a hard stop.
+local function getActingPlot(player: Player, requestedPlot: any?): Model?
+	local plotService = cachedModules.PlotService
+	if not plotService then return nil end
+
+	if typeof(requestedPlot) == "Instance"
+		and requestedPlot:IsA("Model")
+		and requestedPlot.Parent == workspace:FindFirstChild("Plots")
+	then
+		-- CanPlayerBuild is the authority. The player must also actually be at
+		-- the plot -- otherwise a granted friend could build remotely in a store
+		-- on the other side of the map while standing in their own.
+		if plotService.CanPlayerBuild(player, requestedPlot) then
+			local serverResolved = plotService.resolveActingPlot(player, true)
+			if serverResolved == requestedPlot then
+				return requestedPlot
+			end
+		end
+	end
+
+	return plotService.getActingPlot(player, true)
+end
+
+-- Final gate immediately before any mutation. getActingPlot already implies
+-- permission, but re-asserting it here means a future caller that resolves a
+-- plot some other way still cannot skip the check.
+local function assertCanBuild(player: Player, plot: Model?): boolean
+	if not plot then return false end
+	local plotService = cachedModules.PlotService
+	if not plotService then return false end
+	if plotService.CanPlayerBuild(player, plot) then return true end
+
+	local clientNotify = cachedModules.ClientNotifyService
+	if clientNotify then
+		clientNotify.notify(player, "Decline", "You do not have permission to build here!")
+	end
+	return false
+end
+
+local function getPlotOwner(plot: Model?): Player?
+	if not plot then return nil end
+	local ownerId = plot:GetAttribute("USERID")
+	if typeof(ownerId) ~= "number" or ownerId == 0 then return nil end
+	return Players:GetPlayerByUserId(ownerId)
+end
+
+local function getBuildObjectsFolder(plot: Model): Folder
+	local buildObjects = plot:FindFirstChild("BuildObjects")
+	if not buildObjects then
+		buildObjects = Instance.new("Folder")
+		buildObjects.Name = "BuildObjects"
+		buildObjects.Parent = plot
+	end
+	return buildObjects :: Folder
+end
+
+local function findObjectByBuildId(plot: Model, buildId: number): Instance?
+	local buildObjects = plot:FindFirstChild("BuildObjects")
+	if not buildObjects then return nil end
+	for _, obj in buildObjects:GetChildren() do
+		if obj:GetAttribute("BuildId") == buildId then return obj end
+	end
+	return nil
+end
+
+local function savePlotState(player: Player)
+	local plotService = cachedModules.PlotService
+	if plotService and plotService.savePlotState then
+		plotService.savePlotState(player)
+	end
+end
+
+local function savePlotForPlot(plot: Model?, actingPlayer: Player)
+	local owner = getPlotOwner(plot)
+	savePlotState(owner or actingPlayer)
+
+	-- Rescore the store the moment its contents change. The rating used to move
+	-- only on StoreRatingService's 7-second pulse, so placing or deleting
+	-- something appeared to do nothing for up to seven seconds -- which reads as
+	-- "the decor score is broken" rather than "the decor score is late", and is
+	-- long enough for a player to place several more items wondering why the
+	-- number never moves.
+	--
+	-- Hooked HERE, at the one function every place / delete / store / clear path
+	-- already funnels through, rather than at each of those call sites, so a
+	-- future build action cannot forget to trigger it. requestRefresh coalesces
+	-- per frame, so a drag laying 30 tiles still only rescores once.
+	local storeRatingService = cachedModules.StoreRatingService
+	if plot and storeRatingService and storeRatingService.requestRefresh then
+		storeRatingService.requestRefresh(plot)
+	end
+end
+
+local function getBuildInventory(player: Player): {[string]: number}
+	local dataService = cachedModules.DataService
+	local playerData = dataService and dataService.getData(player)
+	if not playerData then return {} end
+	playerData.BuildInventory = playerData.BuildInventory or {}
+	return playerData.BuildInventory
+end
+
+local function sendInventoryUpdate(player: Player)
+	local inventory = getBuildInventory(player)
+	ReplicatedStorage.RemoteEvents.InventoryUpdate:FireClient(player, inventory)
+end
+
+local function applyFloorTags(obj: Instance)
+	local isFloor = obj:GetAttribute("IsFloor") == true
+		or string.find(string.lower(obj.Name), "floor") ~= nil
+	if isFloor then
+		if obj:IsA("BasePart") then
+			CollectionService:AddTag(obj, "Object_IgnoreCollision")
+		elseif obj:IsA("Model") then
+			for _, part in obj:GetDescendants() do
+				if part:IsA("BasePart") then
+					CollectionService:AddTag(part, "Object_IgnoreCollision")
+				end
+			end
+		end
+	end
+end
+
+-- ITEM #10: GUEST BUILDS ARE BILLED TO THE PLOT OWNER.
+--
+-- `payer` is the plot's owner, not necessarily whoever fired the remote. A
+-- friend granted WorkBuild is decorating the OWNER's shop with the OWNER's
+-- money -- and the owner is the one who gets the sell value back if the item is
+-- later removed (DeleteObject/StoreObject already routed refunds and stored
+-- items to the owner). Charging the guest instead made those two halves
+-- disagree: a guest paid for a rack and the owner could immediately sell it and
+-- pocket the refund, repeatable per item.
+--
+-- `actor` is still passed separately so the "you can't afford it" notification
+-- reaches the person who actually clicked, rather than silently failing for
+-- them and pinging someone across the map.
+local function chargeForAsset(payer: Player, actor: Player, asset: Instance, quantity: number?): boolean
+	quantity = quantity or 1
+	local coinPrice = (asset:GetAttribute("CoinPrice") or 0) * quantity
+	local diamondPrice = (asset:GetAttribute("DiamondPrice") or 0) * quantity
+	if coinPrice <= 0 and diamondPrice <= 0 then return true end
+
+	local moneyService = cachedModules.MoneyService
+	local clientNotify = cachedModules.ClientNotifyService
+	if not moneyService then return true end -- fail open rather than block building if service isn't loaded yet
+
+	-- No resolvable owner (they logged out mid-build) -- refuse rather than
+	-- falling back to charging the guest, which would resurrect the exact
+	-- asymmetry described above.
+	if not payer then
+		if clientNotify then clientNotify.notify(actor, "Decline", "The store owner has left — you can't build here right now.") end
+		return false
+	end
+
+	local isGuest = payer ~= actor
+
+	if coinPrice > 0 and not moneyService.hasEnoughCoins(payer, coinPrice) then
+		if clientNotify then
+			clientNotify.notify(actor, "Decline", isGuest and "The store owner can't afford that!" or "Not enough coins for that!")
+		end
+		return false
+	end
+	if diamondPrice > 0 and not moneyService.hasEnoughDiamonds(payer, diamondPrice) then
+		if clientNotify then
+			clientNotify.notify(actor, "Decline", isGuest and "The store owner can't afford that!" or "Not enough diamonds for that!")
+		end
+		return false
+	end
+
+	if coinPrice > 0 and not moneyService.removeCoins(payer, coinPrice) then return false end
+	if diamondPrice > 0 and not moneyService.removeDiamonds(payer, diamondPrice) then return false end
+	return true
+end
+
+-- Mirror of chargeForAsset for the rejection path, so a refund always lands in
+-- the same wallet the charge came out of.
+local function refundAsset(payer: Player?, asset: Instance, quantity: number?)
+	if not payer then return end
+	quantity = quantity or 1
+	local moneyService = cachedModules.MoneyService
+	if not moneyService then return end
+
+	local coinPrice = (asset:GetAttribute("CoinPrice") or 0) * quantity
+	local diamondPrice = (asset:GetAttribute("DiamondPrice") or 0) * quantity
+	-- refundCoins (not giveCoins) so a refund can't be inflated by an active
+	-- sale multiplier or counted as store earnings.
+	if coinPrice > 0 then moneyService.refundCoins(payer, coinPrice) end
+	if diamondPrice > 0 and moneyService.giveDiamonds then moneyService.giveDiamonds(payer, diamondPrice) end
+end
+
+-- ITEM #5: every placed instance is anchored on the way in.
+--
+-- Build objects are static furniture; leaving any part unanchored lets the
+-- physics solver resolve an intersection by launching it, which is exactly what
+-- happens the moment overlap validation is bypassed and two models genuinely
+-- occupy the same space. Anchoring makes the No-Collision mode safe rather than
+-- a furniture cannon, and costs nothing in the normal case.
+--
+-- Deliberately skips anything a script may want to move: seats an NPC sits in
+-- still need their own handling, so only BaseParts are touched and welds/
+-- constraints are left alone.
+-- ITEM #6: idempotent safety net on the placement path, matching the one in
+-- PlotService.restorePlotState. The catalogue is already converted, so this is
+-- normally a no-op; it covers an asset re-published with legacy marker parts,
+-- which would otherwise reintroduce exactly the invisible bounding boxes this
+-- refactor removed -- and only on the specific item, silently.
+local function migrateMarkers(obj: Instance)
+	pcall(InteractionMarkers.migrate, obj)
+end
+
+local function anchorPlacedObject(obj: Instance)
+	if obj:IsA("BasePart") then
+		obj.Anchored = true
+		return
+	end
+	for _, part in obj:GetDescendants() do
+		if part:IsA("BasePart") then
+			part.Anchored = true
+		end
+	end
+end
+
+-- ==========================================================================
+-- ITEM #9: DYNAMIC OBJECT INVALIDATION
+-- ==========================================================================
+--
+-- When a player moves, stores or deletes something, any NPC currently walking
+-- toward it or using it has to find out IMMEDIATELY -- not when it arrives and
+-- indexes a destroyed model (which throws and silently kills that NPC's whole
+-- coroutine, taking its register queue slot with it).
+--
+-- Two signals, because the two cases are genuinely different:
+--
+--   removed -- the instance is about to leave the world. Flagged BEFORE the
+--              reparent/destroy so watchers see it while the instance is still
+--              addressable; polling Parent alone would catch it a tick later,
+--              and not at all for the brief window where Parent is still set.
+--
+--   moved   -- the instance SURVIVES, so nothing about its identity changes and
+--              no liveness check can detect it. Every NPC that already computed
+--              a path is now walking to where it used to be. A monotonic
+--              revision counter lets a watcher capture the value it started
+--              with and notice the difference.
+--
+-- Both are plain attributes rather than a signal/registry, deliberately: they
+-- replicate with the instance, cost nothing to read from any NPC coroutine, and
+-- cannot leak a reference to an object that is being destroyed.
+local function notifyObjectRemoved(plot: Model, obj: Instance)
+	if not obj then return end
+	pcall(function()
+		obj:SetAttribute("Invalidated", true)
+	end)
+end
+
+local function notifyObjectMoved(plot: Model, obj: Instance)
+	if not obj then return end
+	pcall(function()
+		obj:SetAttribute("MoveRevision", (obj:GetAttribute("MoveRevision") or 0) + 1)
+	end)
+end
+
+-- ==========================================================================
+-- ITEM #3: DOORS AND WINDOWS CUT INTO EXISTING WALL RUNS
+-- ==========================================================================
+--
+-- Walls, windows and doors are all PlacementType "Wall" and each occupies
+-- exactly one cell EDGE of the building lattice. Placing a door onto an edge a
+-- wall already fills is therefore two objects in one slot, which
+-- Validation.HasValidPlacement correctly rejects as a duplicate.
+--
+-- Correct, but unusable: the only way to fit a door into a finished wall was to
+-- find and delete that exact segment first -- and players who guessed wrong
+-- ended up with a door frame clipped through a wall, which is the reported
+-- symptom. The intent when you drop a door on a wall is unambiguous: replace
+-- that segment.
+--
+-- So the occupant is displaced (not yet destroyed) BEFORE validation runs, and
+-- only actually removed once the new piece has been accepted. If validation
+-- fails for any other reason the displaced wall is put straight back, so a
+-- rejected placement can never eat a wall the player still had.
+local function findWallAtSameEdge(plot: Model, newObject: Instance): Instance?
+	local buildObjects = plot:FindFirstChild("BuildObjects")
+	if not buildObjects then return nil end
+
+	for _, obj in buildObjects:GetChildren() do
+		if obj ~= newObject
+			and (obj:GetAttribute("BuildType") == "Wall" or obj:GetAttribute("PlacementType") == "Wall")
+		then
+			local ok, same = pcall(Validation.OccupiesSameEdge, newObject, obj)
+			if ok and same then return obj end
+		end
+	end
+	return nil
+end
+
+-- Lifts the occupant out of the world so the overlap test can't see it.
+-- Returns a restore closure and the displaced instance.
+local function displaceWallAtEdge(plot: Model, newObject: Instance, isWallPlacement: boolean)
+	if not isWallPlacement then return nil, nil end
+
+	local occupant = findWallAtSameEdge(plot, newObject)
+	if not occupant then return nil, nil end
+
+	local originalParent = occupant.Parent
+	occupant.Parent = nil
+
+	return function()
+		if occupant and originalParent then
+			occupant.Parent = originalParent
+		end
+	end, occupant
+end
+
+-- Called once the replacement is confirmed. The displaced segment is refunded
+-- to the plot OWNER on the same rule every other removal follows (ITEM #10) --
+-- the owner paid for it, so the owner gets its value back, never the guest who
+-- happened to be holding the door.
+local function commitDisplacedWall(plot: Model, occupant: Instance?)
+	if not occupant then return end
+
+	notifyObjectRemoved(plot, occupant)
+
+	local trophyService = cachedModules.MannequinTrophyService
+	if trophyService then
+		pcall(trophyService.onRemoved, plot, occupant)
+	end
+
+	local owner = getPlotOwner(plot)
+	if owner then
+		local asset = findBuildAsset(occupant.Name)
+		if asset then
+			refundAsset(owner, asset, 1)
+		end
+	end
+
+	occupant:Destroy()
+end
+
+local function applyCollisionSetting(player: Player, obj: Instance)
+	if not collisionDisabled[player] then return end
+	if obj:IsA("BasePart") then
+		obj.CanCollide = false
+	elseif obj:IsA("Model") then
+		for _, part in obj:GetDescendants() do
+			if part:IsA("BasePart") then
+				part.CanCollide = false
+			end
+		end
+	end
+end
+
+local function checkRegisterLimit(player: Player, plot: Model, asset: Instance): boolean
+	if not CollectionService:HasTag(asset, "CashRegister") then return true end
+
+	local boutiqueShopService = cachedModules.BoutiqueShopService
+	if not boutiqueShopService then return true end
+
+	local isSelf = asset:GetAttribute("IsSelfCheckout") == true
+	local existing = boutiqueShopService.getRegistersOnPlot(plot)
+
+	local count = 0
+	for _, register in ipairs(existing) do
+		if (register:GetAttribute("IsSelfCheckout") == true) == isSelf then
+			count += 1
+		end
+	end
+
+	local rating = plot:GetAttribute("StoreRating")
+	local starTier = rating and math.clamp(math.floor(rating), 1, 5) or 1
+	local limits = RegisterLimitConfig[starTier]
+	local maxAllowed = limits and (isSelf and limits.MaxSelfCheckouts or limits.MaxRegisters) or 1
+
+	if count >= maxAllowed then
+		local clientNotify = cachedModules.ClientNotifyService
+		if clientNotify then
+			clientNotify.notify(
+				player,
+				"Decline",
+				(isSelf and "Self-Checkout limit reached!" or "Register limit reached!") .. " Improve your store rating to place more."
+			)
+		end
+		return false
+	end
+
+	return true
+end
+
+local function isWallInstance(instance: Instance?): boolean
+	while instance do
+		if instance:GetAttribute("PlacementType") == "Wall"
+			or instance:GetAttribute("BuildType") == "Wall" then
+			return true
+		end
+		instance = instance.Parent
+		if instance == workspace then break end
+	end
+	return false
+end
+
+local function sanitiseMountNormal(value: any): Vector3?
+	if typeof(value) ~= "Vector3" then return nil end
+	local flat = Vector3.new(value.X, 0, value.Z)
+	if flat.Magnitude < 1e-3 then return nil end
+	return flat.Unit
+end
+
+local function applyMountNormal(obj: Instance, value: any)
+	local placementType = PlacementTypeConfig.Get(obj)
+	if placementType ~= PlacementTypeConfig.Types.WallSurface
+		and placementType ~= PlacementTypeConfig.Types.FloorWallAnchored then
+		return
+	end
+
+	local normal = sanitiseMountNormal(value)
+	if normal then
+		obj:SetAttribute("MountNormal", normal)
+	end
+end
+
+local function enforceGrounding(plot: Model, obj: Instance)
+	local placementType = PlacementTypeConfig.Get(obj)
+
+	if placementType == PlacementTypeConfig.Types.Floor
+		or placementType == PlacementTypeConfig.Types.FloorWallAnchored then
+		local floorHeight = PlacementTypeConfig.GetFloorHeight(plot)
+		if floorHeight then
+			obj:PivotTo(PlacementTypeConfig.SnapBottomTo(obj, obj:GetPivot(), floorHeight))
+		end
+		return
+	end
+
+	if placementType == PlacementTypeConfig.Types.Ceiling then
+		if PlacementTypeConfig.IsModularTile(obj, BuildSettings.BuildModule or 8) then return end
+
+		-- Hang from a real ceiling piece if there is one overhead, otherwise from
+		-- the plot's ceiling plane. Kept in step with the client preview in
+		-- PlacingService.GetTargetCF -- if the two pick different heights the light
+		-- visibly jumps the instant it's placed.
+		local pivot = obj:GetPivot()
+		local undersideY = PlacementTypeConfig.FindCeilingUnderside(plot, pivot.Position.X, pivot.Position.Z)
+		local mountY = if undersideY
+			then undersideY - PlacementTypeConfig.CeilingMountClearance
+			else PlacementTypeConfig.GetCeilingHeight(plot, BuildSettings.CeilingSnapHeight)
+		if mountY then
+			obj:PivotTo(PlacementTypeConfig.SnapTopTo(obj, pivot, mountY))
+		end
+	end
+end
+
+-- How far past its own back face a mounted item may look for its wall. Only has
+-- to cover the deliberate mounting gap plus slack for the grid snap, so it stays
+-- small: a large value would let an item "find" a wall it isn't against.
+local WALL_MOUNT_PROBE_DISTANCE = 1.5
+
+local function validatePlacementServerSide(plot: Model, obj: Instance, isWallPlacement: boolean, allowOverlap: boolean?): boolean
+	local buildObjects = plot:FindFirstChild("BuildObjects")
+	local includeInstances = buildObjects and { buildObjects } or nil
+
+	local placementType = PlacementTypeConfig.Get(obj)
+
+	-- Snap to the floor/ceiling BEFORE the overlap test, so the position that
+	-- gets validated is the position the object will actually occupy.
+	enforceGrounding(plot, obj)
+
+	-- Ceiling FIXTURES (hanging lights, flush lights) used to be rejected unless
+	-- a real ceiling tile or skylight sat directly overhead. That made them
+	-- unplaceable across almost any store, since a build is mostly open ceiling
+	-- until the very end, and the player got a bare "can't place there" with
+	-- nothing on screen explaining what was missing. enforceGrounding still
+	-- prefers a real ceiling piece's underside when one exists; the requirement
+	-- itself is gone.
+
+	-- Types allowed to overlap walls (and ONLY walls). Kept in sync with the
+	-- client preview in PlacingService.Render -- if these two disagree the player
+	-- sees green and gets rejected, or sees red and never tries.
+	--
+	-- Ceiling: the ceiling plane sits inside the top stud of the wall band, so
+	-- closing a roof against the walls is always an overlap.
+	--
+	-- WallSurface: mirrors, wall lights, neon signs and wall art are snapped
+	-- FLUSH onto a wall by definition, and workspace:GetPartsInPart reports
+	-- coincident faces as intersecting -- so the supporting wall was rejecting
+	-- the very items that are meant to hang on it. Every non-wall object still
+	-- blocks, which is what keeps two wall items off the same patch of wall.
+	local ignoresWallOverlap = placementType == PlacementTypeConfig.Types.Ceiling
+		or placementType == PlacementTypeConfig.Types.WallSurface
+
+	if not Validation.HasValidPlacement(obj, includeInstances, isWallPlacement, ignoresWallOverlap, allowOverlap) then
+		return false
+	end
+	-- "Is there actually a wall behind this?" for the two mounted types.
+	--
+	-- Two things were wrong with the old version of this check, and between them
+	-- they rejected essentially every mounted placement:
+	--
+	--   1. It aimed along -LookVector, which carries the player's rotation. Only
+	--      an unrotated item pointed at the wall; every other rotation fired the
+	--      probe sideways into open air. Now it aims along the recorded
+	--      MountNormal, which is the wall face the player actually clicked.
+	--
+	--   2. It started the probe at the object's PIVOT and travelled a fixed short
+	--      distance -- 1.5 studs for FloorWallAnchored. A prefab's pivot is
+	--      wherever the artist left it: the Flush Wall Rack's sits 2.65 studs in
+	--      front of the wall it is flush against, so the probe stopped short of
+	--      the wall every single time and the rack could never be placed at all.
+	--      Now it starts just inside the object's own BACK FACE, measured the
+	--      same pivot-independent way the client used to position it, so the
+	--      distance travelled is the width of the mounting gap and nothing else.
+	-- The wall-behind-me probe is NOT relaxed by allowOverlap. "Let items pass
+	-- through each other" is a convenience; "let a mirror hang in mid-air with no
+	-- wall behind it" is a different feature nobody asked for, and it would also
+	-- strand the item when the wall it was never attached to gets deleted.
+	if placementType == PlacementTypeConfig.Types.FloorWallAnchored
+		or placementType == PlacementTypeConfig.Types.WallSurface then
+		local mountNormal = sanitiseMountNormal(obj:GetAttribute("MountNormal"))
+		if not mountNormal then return false end
+
+		local finalCF = obj:GetPivot()
+		local checkParams = RaycastParams.new()
+		checkParams.FilterDescendantsInstances = { obj }
+		checkParams.FilterType = Enum.RaycastFilterType.Exclude
+
+		-- Distance from the pivot back to the object's own rear face along the
+		-- mounting axis, at its current rotation.
+		local half, centreOffset = PlacementTypeConfig.MeasureAlong(obj, finalCF.Rotation, mountNormal)
+		local toBackFace = half - centreOffset
+
+		-- Start a hair in FRONT of the back face so the probe crosses the mounting
+		-- gap (the client leaves 0.02 studs) rather than starting inside the wall.
+		local origin = finalCF.Position - mountNormal * (toBackFace - 0.05)
+		local result = workspace:Raycast(origin, -mountNormal * WALL_MOUNT_PROBE_DISTANCE, checkParams)
+		if not (result and isWallInstance(result.Instance)) then
+			return false
+		end
+	end
+
+	-- SurfaceTop items must actually be sitting on a SurfaceZone. The client
+	-- guarantees this for a single placement because it snaps to whichever zone
+	-- is under the cursor -- but a DRAGGED row projects forward blindly, so the
+	-- far end can run off the edge of the table. Without this the overshoot
+	-- placed successfully and only got cleaned up later by the orphan sweep,
+	-- which reads to the player as "my decorations vanished".
+	--
+	-- Uses the same downward probe as returnOrphanedSurfaceTopObjects so the
+	-- two agree on what "supported" means.
+	if placementType == PlacementTypeConfig.Types.SurfaceTop then
+		local cf: CFrame?, size: Vector3?
+		if obj:IsA("Model") then
+			cf, size = obj:GetBoundingBox()
+		elseif obj:IsA("BasePart") then
+			cf, size = obj.CFrame, obj.Size
+		end
+		if not (cf and size) then return false end
+
+		local supportParams = RaycastParams.new()
+		supportParams.FilterDescendantsInstances = { buildObjects }
+		supportParams.FilterType = Enum.RaycastFilterType.Include
+
+		local bottomY = cf.Position.Y - size.Y / 2
+		local origin = Vector3.new(cf.Position.X, bottomY - 0.05, cf.Position.Z)
+		local support = workspace:Raycast(origin, Vector3.new(0, -0.4, 0), supportParams)
+		if not (support and support.Instance.Name == "SurfaceZone") then
+			return false
+		end
+	end
+
+	return true
+end
+
+-- Place (single object from build menu or inventory)
+ReplicatedStorage.RemoteEvents.Place.OnServerEvent:Connect(function(player: Player, data: any)
+	local rateLimiter = cachedModules.RateLimiter
+	if rateLimiter and not rateLimiter.guard(player, "Place", 10, 3) then return end
+
+	local objectName = data.ObjectName
+	local cf = data.CF
+	if typeof(objectName) ~= "string" or typeof(cf) ~= "CFrame" then return end
+
+	local plot = getActingPlot(player, data.TargetPlot)
+	if not assertCanBuild(player, plot) then return end
+	if not isWithinPlotBounds(plot, cf.Position) then return end
+	if not checkOwnedLand(player, plot, cf.Position) then return end
+
+	-- ITEM #10: the wallet this placement draws on. Resolved once, up front, and
+	-- used for both the charge and the refund below so the two can never diverge.
+	--
+	-- getPlotOwner resolves the plot's USERID to a Player, so for a player on
+	-- their OWN plot this is simply themselves -- the single-player path is
+	-- unchanged. It is nil only when the owner has disconnected mid-build.
+	local payer = getPlotOwner(plot)
+
+	local asset = findBuildAsset(objectName)
+	if not asset then return end
+	if not checkRegisterLimit(player, plot, asset) then return end
+
+	local trophyService = cachedModules.MannequinTrophyService
+	if trophyService then
+		local canPlaceTrophy, trophyDeclineMsg = trophyService.canPlace(plot, objectName)
+		if not canPlaceTrophy then
+			local clientNotify = cachedModules.ClientNotifyService
+			if clientNotify and trophyDeclineMsg then
+				clientNotify.notify(player, "Decline", trophyDeclineMsg)
+			end
+			return
+		end
+	end
+
+	if data.FromInventory then
+		-- The OWNER's inventory, matching StoreObject -- which already stored
+		-- removed furniture into the owner's profile. Reading the guest's
+		-- inventory here while writing to the owner's on the way out meant a
+		-- guest tidying a friend's shop permanently transferred furniture from
+		-- their own inventory into their friend's.
+		if not payer then
+			local clientNotify = cachedModules.ClientNotifyService
+			if clientNotify then clientNotify.notify(player, "Decline", "The store owner has left — you can't build here right now.") end
+			return
+		end
+		local inventory = getBuildInventory(payer)
+		local count = inventory[objectName] or 0
+		if count <= 0 then return end
+		inventory[objectName] = count - 1
+	else
+		-- Items placed straight from the catalog (not from inventory, which was
+		-- already paid for once) get charged now.
+		if not chargeForAsset(payer, player, asset) then return end
+	end
+
+	local newObject = asset:Clone()
+	newObject:PivotTo(cf)
+	local buildId = buildIdCounter
+	buildIdCounter += 1
+	newObject:SetAttribute("BuildId", buildId)
+
+	-- Walls are architecture, not furniture -- tag them so InteractionClient
+	-- hides Move/Store for them (delete/sell only), the client's magnetic
+	-- snap-node registry can find them, and Auto Wall Hiding can identify them.
+	-- Nothing set this at all before, so none of that worked for a freshly
+	-- placed wall.
+	if asset:GetAttribute("PlacementType") == "Wall" then
+		newObject:SetAttribute("BuildType", "Wall")
+	end
+
+	applyMountNormal(newObject, data.MountNormal)
+
+	-- ITEM #3: a door/window dropped onto an occupied wall edge replaces that
+	-- segment rather than being rejected as a duplicate.
+	local isWallAsset = asset:GetAttribute("PlacementType") == "Wall"
+	local restoreDisplaced, displacedWall = displaceWallAtEdge(plot, newObject, isWallAsset)
+
+	if not validatePlacementServerSide(plot, newObject, isWallAsset, overlapBypassed(player)) then
+		-- Put the displaced segment straight back: a rejected placement must
+		-- never cost the player a wall they still had.
+		if restoreDisplaced then restoreDisplaced() end
+		newObject:Destroy()
+
+		-- REFUND. The charge happens above, BEFORE this validation runs, and this
+		-- branch used to just return -- so every rejected placement silently took
+		-- the player's money and gave them nothing. Players hit this constantly
+		-- (any "Can't place there!" was a real charge), and with nothing placed
+		-- there was no object to sell back to recover it.
+		-- Refunded to whoever was charged, never to whoever clicked.
+		if data.FromInventory then
+			if payer then
+				local inventory = getBuildInventory(payer)
+				inventory[objectName] = (inventory[objectName] or 0) + 1
+				sendInventoryUpdate(payer)
+			end
+		else
+			refundAsset(payer, asset)
+		end
+
+		local clientNotify = cachedModules.ClientNotifyService
+		if clientNotify then
+			clientNotify.notify(player, "Decline", "Can't place there!")
+		end
+		return
+	end
+
+	-- Accepted -- now the displaced segment can actually go.
+	commitDisplacedWall(plot, displacedWall)
+
+	applyFloorTags(newObject)
+	applyCollisionSetting(player, newObject)
+	anchorPlacedObject(newObject)
+	migrateMarkers(newObject)
+	newObject.Parent = getBuildObjectsFolder(plot)
+
+	if trophyService then
+		trophyService.onPlaced(plot, newObject, player)
+	end
+
+	do
+		local progressService = cachedModules.ProgressService
+		if progressService then
+			progressService.report(player, "PlaceObject", 1)
+		end
+	end
+
+	savePlotForPlot(plot, player)
+
+	ReplicatedStorage.RemoteEvents.PlacementResult:FireClient(player, {
+		ObjectName = objectName,
+		CF = cf,
+		ObjectId = buildId,
+		-- No BatchId: a single placement is its own undo step.
+	})
+
+	if data.FromInventory and payer then
+		sendInventoryUpdate(payer)
+	end
+end)
+
+-- PlaceArea (drag placement of a filled region -- floors AND ceiling tiles)
+--
+-- Ceilings go through this same path rather than PlaceMulti for the same reason
+-- floors do: a ceiling is a big flat expanse of one repeated tile, so N separate
+-- parts would both multiply the part count and re-introduce the texture-seam
+-- problem described below. Only SINGLE-PART tiles are eligible (the client
+-- gates this) -- a Skylight is a ceiling item but is frame + glass, so it goes
+-- down the discrete PlaceMulti path instead and stays intact.
+--
+-- Previously this cloned the floor tile once per grid cell and parented all
+-- of them into a wrapper Model. That painted correctly (every tile ended up
+-- with the same Material/Color/ColorSlot -- verified directly against a live
+-- 169-tile region) but still LOOKED glitchy, because Roblox's built-in
+-- textured materials (Wood, Marble, etc.) tile independently per-part -- each
+-- small 8x8 tile got its own separate texture UV that doesn't line up with
+-- its neighbors, so a painted floor region looked like a patchwork of
+-- mismatched texture crops.
+--
+-- Fix: collapse the whole dragged rectangle into ONE part sized to the full
+-- footprint. One part = one continuous material UV across the entire region,
+-- so the seam/patchwork glitch can't happen at all, and painting is now
+-- trivially guaranteed uniform (there's only one part to paint).
+ReplicatedStorage.RemoteEvents.PlaceArea.OnServerEvent:Connect(function(player: Player, data: any)
+	local rateLimiter = cachedModules.RateLimiter
+	if rateLimiter and not rateLimiter.guard(player, "PlaceArea", 5, 2) then return end
+
+	local objectName = data.ObjectName
+	local cframes = data.CFrames
+	if typeof(objectName) ~= "string" or typeof(cframes) ~= "table" then return end
+
+	-- ITEM #3: THE FULL-PLOT FLOOR DRAG.
+	--
+	-- This cap was 200, and exceeding it did a bare `return` -- no placement, no
+	-- refund needed (nothing had been charged yet), and no message. That is
+	-- exactly the reported "floor placement doesn't reach the outer boundaries of
+	-- the plot": the maximum plot is a 128x128 Base, which at BuildModule 8 is
+	-- 16x16 = 256 cells. Any attempt to floor a fully-expanded plot in one drag
+	-- was therefore over the cap and silently did nothing, so players concluded
+	-- the grid stopped short of the edge.
+	--
+	-- 512 is comfortably above the 256 a maximum plot can produce while still
+	-- bounding a malicious payload -- and a legitimate drag now cannot hit it at
+	-- all. Over-cap is reported rather than swallowed.
+	local MAX_AREA_TILES = 512
+	if #cframes > MAX_AREA_TILES then
+		local clientNotify = cachedModules.ClientNotifyService
+		if clientNotify then
+			clientNotify.notify(player, "Decline", "That area is too large — try it in two passes.")
+		end
+		return
+	end
+
+	local plot = getActingPlot(player, data.TargetPlot)
+	if not assertCanBuild(player, plot) then return end
+
+	local payer = getPlotOwner(plot)
+
+	local asset = findBuildAsset(objectName)
+	if not asset then return end
+
+	local tileTemplate = getRepresentativePart(asset)
+	if not tileTemplate then return end
+
+	-- Floors and ceilings share the geometry maths but differ in tagging: a floor
+	-- gets Object_IgnoreCollision so players don't trip on tile seams, whereas a
+	-- ceiling must stay solid or players would jump straight through the roof.
+	local isCeiling = PlacementTypeConfig.Get(asset) == PlacementTypeConfig.Types.Ceiling
+		or asset:GetAttribute("IsCeiling") == true
+
+	-- Only count tiles that will actually land in-bounds toward the charge, so
+	-- players aren't billed for parts of a drag that get silently dropped below.
+	-- Tiles inside the full plot but outside the OWNED footprint are dropped
+	-- separately (blockedByOwnership) so a drag that spills onto unpurchased
+	-- land still places on the part that's actually owned instead of failing
+	-- outright, while still telling the player why the rest didn't place.
+	local validCFrames = {}
+	local blockedByOwnership = false
+	for _, cf in cframes do
+		if typeof(cf) == "CFrame" and isWithinPlotBounds(plot, cf.Position) then
+			if isWithinOwnedLand(plot, cf.Position) then
+				table.insert(validCFrames, cf)
+			else
+				blockedByOwnership = true
+			end
+		end
+	end
+	if blockedByOwnership then
+		local clientNotify = cachedModules.ClientNotifyService
+		if clientNotify then
+			clientNotify.notify(player, "Decline", "Buy more land!")
+		end
+	end
+	if #validCFrames == 0 then return end
+	if not chargeForAsset(payer, player, asset, #validCFrames) then return end
+
+	-- The client only ever produces axis-aligned rectangular drags (see
+	-- computeAreaCFrames), so every CFrame in the drag shares the same
+	-- rotation and Y -- the first one defines the whole region's orientation.
+	local regionRotation = validCFrames[1].Rotation
+	local regionY = validCFrames[1].Position.Y
+
+	local minX, maxX, minZ, maxZ = math.huge, -math.huge, math.huge, -math.huge
+	for _, cf in validCFrames do
+		local localPos = regionRotation:PointToObjectSpace(cf.Position)
+		minX = math.min(minX, localPos.X)
+		maxX = math.max(maxX, localPos.X)
+		minZ = math.min(minZ, localPos.Z)
+		maxZ = math.max(maxZ, localPos.Z)
+	end
+
+	local width = (maxX - minX) + tileTemplate.Size.X
+	local depth = (maxZ - minZ) + tileTemplate.Size.Z
+	local centerLocal = Vector3.new((minX + maxX) / 2, 0, (minZ + maxZ) / 2)
+	local centerWorld = regionRotation:PointToWorldSpace(centerLocal)
+	local regionCFrame = regionRotation + Vector3.new(centerWorld.X, regionY, centerWorld.Z)
+
+	local floorPart = tileTemplate:Clone()
+	floorPart.Size = Vector3.new(width, tileTemplate.Size.Y, depth)
+	floorPart.CFrame = regionCFrame
+
+	local buildId = buildIdCounter
+	buildIdCounter += 1
+	-- BuildType stays "FloorModel" for BOTH kinds on purpose: that string is what
+	-- DeleteObject, the sell/refund path, PlotService's save/restore and the
+	-- orphan sweep all key off to recognise "a collapsed drag region". Inventing
+	-- a second string would mean every one of those call sites silently ignoring
+	-- ceilings. The IsCeiling/IsFloor attributes carry the actual distinction.
+	floorPart.Name = (isCeiling and "CeilingRegion_" or "FloorRegion_") .. buildId
+	floorPart:SetAttribute("BuildType", "FloorModel")
+	floorPart:SetAttribute("AssetName", objectName)
+	floorPart:SetAttribute("BuildId", buildId)
+	-- Kept for refunds (DeleteObject) and legacy-save migration, since the
+	-- price was originally per-tile and this is no longer literally N parts.
+	floorPart:SetAttribute("TileCount", #validCFrames)
+	if isCeiling then
+		floorPart:SetAttribute("IsCeiling", true)
+		floorPart:SetAttribute("PlacementType", "Ceiling")
+	else
+		floorPart:SetAttribute("IsFloor", true)
+	end
+	if floorPart:GetAttribute("ColorSlot") == nil then
+		floorPart:SetAttribute("ColorSlot", 1)
+	end
+
+	-- Floors only: tiles are walked on, so they're tagged to be ignored by the
+	-- player collision pass. A ceiling deliberately keeps normal collision.
+	if not isCeiling then
+		applyFloorTags(floorPart)
+	end
+	applyCollisionSetting(player, floorPart)
+	anchorPlacedObject(floorPart)
+	floorPart.Parent = getBuildObjectsFolder(plot)
+
+	do
+		local progressService = cachedModules.ProgressService
+		if progressService then
+			progressService.report(player, "PlaceObject", #validCFrames)
+		end
+	end
+
+	savePlotForPlot(plot, player)
+
+	-- ITEM #11: a floor/ceiling drag was previously invisible to the undo stack
+	-- entirely -- PlaceArea fired no PlacementResult at all, so Ctrl+Z after
+	-- laying a floor either did nothing or reached back past it and undid an
+	-- unrelated earlier action. It collapses to a SINGLE part server-side, so
+	-- one result with one BuildId is the whole entry.
+	ReplicatedStorage.RemoteEvents.PlacementResult:FireClient(player, {
+		ObjectName = objectName,
+		CF = regionCFrame,
+		ObjectId = buildId,
+		IsAreaRegion = true,
+		TileCount = #validCFrames,
+	})
+end)
+
+-- PlaceMulti (drag placement of N DISCRETE objects: racks, furniture, etc.)
+--
+-- Distinct from PlaceArea, which exists only for floors and deliberately
+-- collapses the whole dragged region into a single stretched part. Everything
+-- else has to stay N separate objects so each one keeps its own BuildId and
+-- remains individually movable, sellable and interactable.
+--
+-- Every CFrame is re-validated here exactly as a single Place would be. The
+-- client's fill is a convenience, not an authority: a crafted PlaceMulti
+-- payload would otherwise be a way to bulk-place items overlapping each other,
+-- outside the owned footprint, or past the register cap in one shot.
+ReplicatedStorage.RemoteEvents.PlaceMulti.OnServerEvent:Connect(function(player: Player, data: any)
+	local rateLimiter = cachedModules.RateLimiter
+	if rateLimiter and not rateLimiter.guard(player, "PlaceMulti", 5, 2) then return end
+
+	if typeof(data) ~= "table" then return end
+	local objectName = data.ObjectName
+	local cframes = data.CFrames
+	if typeof(objectName) ~= "string" or typeof(cframes) ~= "table" then return end
+
+	-- Mirrors MAX_MULTI_ITEMS on the client.
+	if #cframes == 0 or #cframes > 60 then return end
+
+	local plot = getActingPlot(player, data.TargetPlot)
+	if not assertCanBuild(player, plot) then return end
+
+	local payer = getPlotOwner(plot)
+	if not payer then
+		local notify = cachedModules.ClientNotifyService
+		if notify then notify.notify(player, "Decline", "The store owner has left — you can't build here right now.") end
+		return
+	end
+
+	local allowOverlap = overlapBypassed(player)
+
+	local asset = findBuildAsset(objectName)
+	if not asset then return end
+
+	local isWallAsset = asset:GetAttribute("PlacementType") == "Wall"
+	local fromInventory = data.FromInventory == true
+
+	local trophyService = cachedModules.MannequinTrophyService
+	local clientNotify = cachedModules.ClientNotifyService
+	local buildObjects = getBuildObjectsFolder(plot)
+
+	local placed = 0
+	local blockedByOwnership = false
+	local blockedByValidation = false
+	local ranOutOfFunds = false
+	local placedObjects = {}
+
+	for _, cf in ipairs(cframes) do
+		if typeof(cf) ~= "CFrame" then continue end
+		if not isWithinPlotBounds(plot, cf.Position) then continue end
+		if not isWithinOwnedLand(plot, cf.Position) then
+			blockedByOwnership = true
+			continue
+		end
+
+		-- Re-checked per item, not once up front: the cap counts what's already
+		-- on the plot, so a drag of five registers has to be told "no" on the
+		-- one that crosses the limit, not waved through because the first was
+		-- under it.
+		if not checkRegisterLimit(player, plot, asset) then break end
+
+		if trophyService then
+			local canPlaceTrophy = trophyService.canPlace(plot, objectName)
+			if not canPlaceTrophy then break end
+		end
+
+		-- Charged one at a time so a drag the player can only half-afford places
+		-- the part they can pay for and stops, rather than either failing wholesale
+		-- or handing out the remainder free.
+		if fromInventory then
+			local inventory = getBuildInventory(payer)
+			local count = inventory[objectName] or 0
+			if count <= 0 then
+				ranOutOfFunds = true
+				break
+			end
+			inventory[objectName] = count - 1
+		else
+			if not chargeForAsset(payer, player, asset) then
+				ranOutOfFunds = true
+				break
+			end
+		end
+
+		local newObject = asset:Clone()
+		newObject:PivotTo(cf)
+		local buildId = buildIdCounter
+		buildIdCounter += 1
+		newObject:SetAttribute("BuildId", buildId)
+		if isWallAsset then
+			newObject:SetAttribute("BuildType", "Wall")
+		end
+
+		applyMountNormal(newObject, data.MountNormal)
+
+		-- Parented BEFORE validating the next one so overlap checks see the items
+		-- already laid down in this same drag. Without that, every slot would be
+		-- validated against an empty row and a too-tight drag could stack items
+		-- inside one another.
+		applyFloorTags(newObject)
+		applyCollisionSetting(player, newObject)
+		anchorPlacedObject(newObject)
+		migrateMarkers(newObject)
+
+		-- ITEM #3, per item in the drag: same replace-the-occupant rule as a
+		-- single placement. Done BEFORE parenting so the overlap test can't see
+		-- the segment being replaced.
+		local restoreDisplaced, displacedWall = displaceWallAtEdge(plot, newObject, isWallAsset)
+
+		newObject.Parent = buildObjects
+
+		if not validatePlacementServerSide(plot, newObject, isWallAsset, allowOverlap) then
+			if restoreDisplaced then restoreDisplaced() end
+			newObject:Destroy()
+			blockedByValidation = true
+
+			-- Refund the slot that didn't take, so a blocked square in the middle
+			-- of a drag isn't silently billed -- to the same wallet it was taken
+			-- from (ITEM #10).
+			if fromInventory then
+				local inventory = getBuildInventory(payer)
+				inventory[objectName] = (inventory[objectName] or 0) + 1
+			else
+				refundAsset(payer, asset)
+			end
+			continue
+		end
+
+		commitDisplacedWall(plot, displacedWall)
+
+		if trophyService then
+			trophyService.onPlaced(plot, newObject, player)
+		end
+
+		placed += 1
+		table.insert(placedObjects, { CF = cf, ObjectId = buildId, Object = newObject })
+	end
+
+	if clientNotify then
+		if blockedByOwnership then
+			clientNotify.notify(player, "Decline", "Buy more land!")
+		elseif ranOutOfFunds and placed > 0 then
+			clientNotify.notify(player, "Decline", `Placed {placed} — ran out!`)
+		elseif blockedByValidation and placed > 0 then
+			clientNotify.notify(player, "Decline", `Placed {placed} — some didn't fit!`)
+		end
+	end
+
+	if placed == 0 then return end
+
+	-- ==========================================================================
+	-- ITEM #12: BATCH SURFACE GROUPING
+	-- ==========================================================================
+	--
+	-- A dragged run of SURFACE panels -- skylights, and any multi-part floor or
+	-- ceiling tile -- is one contiguous surface as far as the player is
+	-- concerned. Left as N loose siblings, re-texturing a skylight roof meant
+	-- painting every panel individually and removing it meant deleting every
+	-- panel individually.
+	--
+	-- Parenting the stroke under one container Model fixes all three tools at
+	-- once, without any of them needing to know about patches:
+	--   * PaintServer resolves a BuildId among BuildObjects' DIRECT children, so
+	--     it now finds the patch and ColorZoneUtils walks the whole surface.
+	--   * InteractionClient walks up to the direct child of BuildObjects, so a
+	--     click on any panel selects (and deletes/sells) the entire patch.
+	--   * DeleteObject/StoreObject already operate on that same direct child.
+	--
+	-- Deliberately NOT applied to furniture drags: a row of racks must stay
+	-- individually movable and sellable, which is the entire reason PlaceMulti
+	-- exists as a separate path from PlaceArea. Single-item "drags" are also
+	-- skipped -- a patch of one is just an object with an extra Model around it.
+	--
+	-- Single-part floor and ceiling tiles never reach here at all: the client
+	-- routes those to PlaceArea, which collapses them into ONE stretched part so
+	-- the material UV stays continuous across the surface. That remains the
+	-- better representation where it applies, and is left untouched.
+	local placementType = PlacementTypeConfig.Get(asset)
+	local isSurfaceDrag = placementType == PlacementTypeConfig.Types.Ceiling
+		or placementType == PlacementTypeConfig.Types.Floor
+
+	local patchModel: Model? = nil
+	if isSurfaceDrag and placed > 1 then
+		local patchId = buildIdCounter
+		buildIdCounter += 1
+
+		local prefix = "SurfacePatch_"
+		if placementType == PlacementTypeConfig.Types.Floor then
+			prefix = "FloorPatch_"
+		elseif asset:GetAttribute("IsSkylight") == true or string.find(string.lower(objectName), "skylight") then
+			prefix = "SkylightPatch_"
+		else
+			prefix = "CeilingPatch_"
+		end
+
+		patchModel = Instance.new("Model")
+		patchModel.Name = prefix .. tostring(patchId)
+		-- BuildType is what save/restore, delete and the refund path key off.
+		patchModel:SetAttribute("BuildType", "SurfacePatch")
+		patchModel:SetAttribute("AssetName", objectName)
+		patchModel:SetAttribute("BuildId", patchId)
+		patchModel:SetAttribute("TileCount", placed)
+		patchModel:SetAttribute("PlacementType", placementType)
+
+		for _, entry in ipairs(placedObjects) do
+			if entry.Object and entry.Object.Parent then
+				entry.Object.Parent = patchModel
+			end
+		end
+
+		-- PrimaryPart so the Model has a stable pivot for save/restore; without
+		-- one, GetPivot falls back to the bounding-box centre, which shifts if a
+		-- panel is ever removed from the patch.
+		patchModel.PrimaryPart = patchModel:FindFirstChildWhichIsA("BasePart", true)
+		patchModel.Parent = buildObjects
+	end
+
+	do
+		local progressService = cachedModules.ProgressService
+		if progressService then
+			progressService.report(player, "PlaceObject", placed)
+		end
+	end
+
+	savePlotForPlot(plot, player)
+
+	-- ITEM #11: undo granularity.
+	--
+	-- A grouped patch is ONE object with ONE BuildId, so undo needs exactly one
+	-- entry pointing at the patch -- reporting the individual panels would push
+	-- entries whose ids are no longer direct children of BuildObjects, and
+	-- DeleteObject (which searches direct children) would silently no-op on
+	-- every one of them.
+	--
+	-- An ungrouped drag still reports per item, tied together by a shared batch
+	-- id so the client folds them into a single atomic entry anyway.
+	if patchModel then
+		ReplicatedStorage.RemoteEvents.PlacementResult:FireClient(player, {
+			ObjectName = objectName,
+			CF = patchModel:GetPivot(),
+			ObjectId = patchModel:GetAttribute("BuildId"),
+			IsPatch = true,
+			TileCount = placed,
+		})
+	else
+		local batchId = (placed > 1) and nextBatchId() or nil
+		for index, entry in ipairs(placedObjects) do
+			ReplicatedStorage.RemoteEvents.PlacementResult:FireClient(player, {
+				ObjectName = objectName,
+				CF = entry.CF,
+				ObjectId = entry.ObjectId,
+				BatchId = batchId,
+				BatchSize = batchId and placed or nil,
+				BatchIndex = batchId and index or nil,
+			})
+		end
+	end
+
+	if fromInventory then
+		sendInventoryUpdate(payer)
+	end
+end)
+
+-- Decorations placed on top of furniture (PlacementType == "SurfaceTop") are
+-- fully independent BuildObjects with no tracked relationship to the furniture
+-- underneath them -- moving/deleting a table doesn't move/delete whatever was
+-- sitting on it. As a safety net against those items floating in mid-air
+-- forever once their table is sold/stored/moved out from under them, this
+-- scans every SurfaceTop object on the plot and returns any that no longer
+-- have a live "SurfaceZone" part directly beneath them back to the player's
+-- inventory (same mechanism as manually storing an item).
+local function returnOrphanedSurfaceTopObjects(player: Player, plot: Model)
+	local buildObjectsFolder = getBuildObjectsFolder(plot)
+	if not buildObjectsFolder then return end
+
+	local checkParams = RaycastParams.new()
+	checkParams.FilterDescendantsInstances = { buildObjectsFolder }
+	checkParams.FilterType = Enum.RaycastFilterType.Include
+
+	-- Snapshot children first -- we may mutate buildObjectsFolder (reparenting
+	-- orphans out) while iterating, which isn't safe to do against a live
+	-- GetChildren() call.
+	local candidates = buildObjectsFolder:GetChildren()
+	local orphaned = {}
+
+	for _, obj in ipairs(candidates) do
+		if obj:GetAttribute("PlacementType") == "SurfaceTop" then
+			local cf: CFrame?, size: Vector3?
+			if obj:IsA("Model") then
+				cf, size = obj:GetBoundingBox()
+			elseif obj:IsA("BasePart") then
+				cf, size = obj.CFrame, obj.Size
+			end
+
+			if cf and size then
+				local bottomY = cf.Position.Y - size.Y / 2
+				local origin = Vector3.new(cf.Position.X, bottomY - 0.05, cf.Position.Z)
+				local result = workspace:Raycast(origin, Vector3.new(0, -0.4, 0), checkParams)
+				local stillSupported = result ~= nil and result.Instance.Name == "SurfaceZone"
+
+				if not stillSupported then
+					table.insert(orphaned, obj)
+				end
+			end
+		end
+	end
+
+	if #orphaned == 0 then return end
+
+	-- Same routing rule: these items came off the owner's plot, so they return
+	-- to the owner's inventory. Left unclaimed (owner offline) they'd be
+	-- destroyed with no record, so leave them standing instead.
+	local recipient = getPlotOwner(plot)
+	if not recipient then return end
+
+	local inventory = getBuildInventory(recipient)
+	for _, obj in ipairs(orphaned) do
+		inventory[obj.Name] = (inventory[obj.Name] or 0) + 1
+		obj.Parent = nil
+	end
+
+	sendInventoryUpdate(recipient)
+
+	local clientNotify = cachedModules.ClientNotifyService
+	if clientNotify then
+		local message = #orphaned == 1
+			and "An item lost its surface and was returned to your inventory."
+			or (#orphaned .. " items lost their surface and were returned to your inventory.")
+		clientNotify.notify(recipient, "Player", message)
+	end
+end
+
+-- Computes the coin/diamond value of an already-placed object (a single item,
+-- or an entire FloorRegion grouped model) using the catalog asset's price
+-- attributes, for refunding on delete.
+local function valueOfPlacedObject(obj: Instance): (number, number)
+	local buildType = obj:GetAttribute("BuildType")
+	local isFloorRegion = buildType == "FloorModel"
+	-- ITEM #12: a surface patch is a generated container -- its NAME
+	-- ("SkylightPatch_412") is not a catalogue entry, so valuing it by name would
+	-- find no asset and refund nothing for what may be dozens of paid panels.
+	-- Both grouped forms therefore carry the real asset name on an attribute.
+	local isSurfacePatch = buildType == "SurfacePatch"
+	local assetName = (isFloorRegion or isSurfacePatch) and obj:GetAttribute("AssetName") or obj.Name
+	local asset = assetName and findBuildAsset(assetName)
+	if not asset then return 0, 0 end
+
+	if isSurfacePatch then
+		local quantity = obj:GetAttribute("TileCount") or #obj:GetChildren()
+		return (asset:GetAttribute("CoinPrice") or 0) * quantity,
+			(asset:GetAttribute("DiamondPrice") or 0) * quantity
+	end
+
+	-- Floor regions used to be a Model with one child per tile (quantity =
+	-- child count); they're now a single scaled part, so the tile count is
+	-- carried on a TileCount attribute instead. Fall back to counting children
+	-- for any pre-existing Model-shaped floor region that hasn't been
+	-- re-placed/re-saved yet.
+	local quantity = isFloorRegion and (obj:GetAttribute("TileCount") or #obj:GetChildren()) or 1
+	return (asset:GetAttribute("CoinPrice") or 0) * quantity, (asset:GetAttribute("DiamondPrice") or 0) * quantity
+end
+
+-- DeleteObject (by BuildId)
+ReplicatedStorage.RemoteEvents.DeleteObject.OnServerEvent:Connect(function(player: Player, data: any)
+	local rateLimiter = cachedModules.RateLimiter
+	if rateLimiter and not rateLimiter.guard(player, "DeleteObject", 10, 3) then return end
+
+	local objectId = data.ObjectId
+	if typeof(objectId) ~= "number" then return end
+
+	local plot = getActingPlot(player, data.TargetPlot)
+	if not assertCanBuild(player, plot) then return end
+
+	local obj = findObjectByBuildId(plot, objectId)
+	if not obj then return end
+
+	-- ITEM #9: tell the NPCs BEFORE the object leaves the world, so a customer
+	-- walking toward this rack (or queued at this register) drops its reference
+	-- and repaths on the same frame instead of arriving at a destroyed model.
+	notifyObjectRemoved(plot, obj)
+
+	-- FloorModel and Wall are both BuildType-tagged; both fall through to the
+	-- normal refund+delete path below.
+
+	-- Bulk sell/delete refund -- selling a whole FloorRegion (or any single
+	-- item) instantly refunds what was paid for it, all at once, rather than
+	-- requiring the player to delete tile-by-tile for a partial value.
+	-- The owner paid for this item at placement time, so the owner gets the sell
+	-- value -- never the acting player. If the owner is offline the item is still
+	-- removed, but nobody is credited; paying the actor was the exploit.
+	local refundRecipient = getPlotOwner(plot)
+	local refundCoins, refundDiamonds = valueOfPlacedObject(obj)
+	if refundRecipient and (refundCoins > 0 or refundDiamonds > 0) then
+		local moneyService = cachedModules.MoneyService
+		if moneyService then
+			if refundCoins > 0 then moneyService.refundCoins(refundRecipient, refundCoins) end
+			if refundDiamonds > 0 and moneyService.giveDiamonds then moneyService.giveDiamonds(refundRecipient, refundDiamonds) end
+
+			local clientNotify = cachedModules.ClientNotifyService
+			if clientNotify and refundCoins > 0 then
+				local NumberFormat = require(ReplicatedStorage.Modules.NumberFormat)
+				clientNotify.notify(refundRecipient, "Player", "Refunded " .. NumberFormat.Abbreviate(refundCoins) .. " coins!")
+			end
+		end
+	end
+
+	local isFloorRegion = obj:GetAttribute("BuildType") == "FloorModel"
+	trashStore[objectId] = {
+		Name = isFloorRegion and (obj:GetAttribute("AssetName") or obj.Name) or obj.Name,
+		CF = obj:GetPivot(),
+		Attributes = {},
+		-- Floor regions are a single part sized to the whole dragged footprint
+		-- now, not the catalog's default tile size -- undo needs to restore
+		-- that exact size, not just re-clone a single default-size tile.
+		IsFloorRegion = isFloorRegion,
+		Size = (isFloorRegion and obj:IsA("BasePart")) and obj.Size or nil,
+		-- trashStore is keyed by a single server-wide monotonic BuildId with no
+		-- ownership check on RestoreObject -- record which plot this came from
+		-- so a player (or a WorkBuild friend acting on an unrelated plot) can't
+		-- restore an item that was deleted from someone else's plot just by
+		-- guessing/enumerating a sequential BuildId.
+		OwnerId = plot:GetAttribute("USERID"),
+	}
+	for _, attrName in {
+		"IsFloor", "Category", "SprayEffect", "CurrentStock", "StockAmount", "MaxSlots", "TileCount",
+		-- Paint attributes weren't captured at all before, so undo-deleting any
+		-- painted object (not just floors) silently reverted it back to
+		-- unpainted. Captured here and actually reapplied below in RestoreObject.
+		"Paint_Color1", "Paint_Color2", "Paint_Color3", "Paint_Color4",
+		"Paint_Material1", "Paint_Material2", "Paint_Material3", "Paint_Material4",
+	} do
+		local val = obj:GetAttribute(attrName)
+		if val ~= nil then
+			trashStore[objectId].Attributes[attrName] = val
+		end
+	end
+
+	local trophyService = cachedModules.MannequinTrophyService
+	if trophyService then
+		trophyService.onRemoved(plot, obj)
+	end
+
+	obj.Parent = nil
+	returnOrphanedSurfaceTopObjects(player, plot)
+	savePlotForPlot(plot, player)
+end)
+
+-- RestoreObject (undo delete)
+ReplicatedStorage.RemoteEvents.RestoreObject.OnServerEvent:Connect(function(player: Player, data: any)
+	local rateLimiter = cachedModules.RateLimiter
+	if rateLimiter and not rateLimiter.guard(player, "RestoreObject", 10, 3) then return end
+
+	local objectId = data.ObjectId
+	if typeof(objectId) ~= "number" then return end
+
+	local trashEntry = trashStore[objectId]
+	if not trashEntry then return end
+
+	local plot = getActingPlot(player, data.TargetPlot)
+	if not assertCanBuild(player, plot) then return end
+	if trashEntry.OwnerId and trashEntry.OwnerId ~= plot:GetAttribute("USERID") then return end
+	if not isWithinPlotBounds(plot, trashEntry.CF.Position) then return end
+
+	local asset = findBuildAsset(trashEntry.Name)
+	if not asset then return end
+
+	local newObject: Instance
+	if trashEntry.IsFloorRegion then
+		local tileTemplate = getRepresentativePart(asset)
+		if not tileTemplate then return end
+		newObject = tileTemplate:Clone()
+		if trashEntry.Size then
+			newObject.Size = trashEntry.Size
+		end
+		newObject:SetAttribute("BuildType", "FloorModel")
+		newObject:SetAttribute("AssetName", trashEntry.Name)
+		if newObject:GetAttribute("ColorSlot") == nil then
+			newObject:SetAttribute("ColorSlot", 1)
+		end
+	else
+		newObject = asset:Clone()
+	end
+
+	newObject:PivotTo(trashEntry.CF)
+	newObject:SetAttribute("BuildId", objectId)
+
+	if asset:GetAttribute("PlacementType") == "Wall" then
+		newObject:SetAttribute("BuildType", "Wall")
+	end
+
+	-- Includes MountNormal for mounted items: an undo-delete puts the item back
+	-- on the same wall face it came off, so the recorded normal is still correct
+	-- and validatePlacementServerSide's wall probe has what it needs.
+	for attrName, val in pairs(trashEntry.Attributes) do
+		newObject:SetAttribute(attrName, val)
+	end
+
+	-- Reapply the actual visual paint -- attributes alone are just the record;
+	-- PlotService reads them on a full plot restore, but nothing previously
+	-- did the equivalent for a single undo-delete.
+	for zoneNum = 1, 4 do
+		local color = newObject:GetAttribute("Paint_Color" .. zoneNum)
+		local material = newObject:GetAttribute("Paint_Material" .. zoneNum)
+		if color or material then
+			for _, part in ColorZoneUtils.getZoneParts(newObject, zoneNum) do
+				if color then part.Color = color end
+				if material then part.Material = material end
+			end
+		end
+	end
+
+	if not validatePlacementServerSide(plot, newObject, asset:GetAttribute("PlacementType") == "Wall", overlapBypassed(player)) then
+		newObject:Destroy()
+		local clientNotify = cachedModules.ClientNotifyService
+		if clientNotify then
+			clientNotify.notify(player, "Decline", "Can't restore it there -- something's in the way!")
+		end
+		return
+	end
+
+	applyFloorTags(newObject)
+	applyCollisionSetting(player, newObject)
+	anchorPlacedObject(newObject)
+	migrateMarkers(newObject)
+	newObject.Parent = getBuildObjectsFolder(plot)
+
+	local trophyService = cachedModules.MannequinTrophyService
+	if trophyService then
+		trophyService.onPlaced(plot, newObject, player)
+	end
+
+	trashStore[objectId] = nil
+	savePlotForPlot(plot, player)
+end)
+
+-- MoveObject (reposition by BuildId)
+ReplicatedStorage.RemoteEvents.MoveObject.OnServerEvent:Connect(function(player: Player, data: any)
+	local rateLimiter = cachedModules.RateLimiter
+	if rateLimiter and not rateLimiter.guard(player, "MoveObject", 10, 3) then return end
+
+	local objectId = data.ObjectId
+	local cf = data.CF
+	if typeof(objectId) ~= "number" or typeof(cf) ~= "CFrame" then return end
+
+	local plot = getActingPlot(player, data.TargetPlot)
+	if not assertCanBuild(player, plot) then return end
+	if not isWithinPlotBounds(plot, cf.Position) then return end
+	if not checkOwnedLand(player, plot, cf.Position) then return end
+
+	local obj = findObjectByBuildId(plot, objectId)
+	if not obj then return end
+
+	local previousCF = obj:GetPivot()
+	local previousMountNormal = obj:GetAttribute("MountNormal")
+	obj:PivotTo(cf)
+	applyMountNormal(obj, data.MountNormal)
+
+	if not validatePlacementServerSide(plot, obj, obj:GetAttribute("BuildType") == "Wall", overlapBypassed(player)) then
+		obj:PivotTo(previousCF)
+		obj:SetAttribute("MountNormal", previousMountNormal)
+		local clientNotify = cachedModules.ClientNotifyService
+		if clientNotify then
+			clientNotify.notify(player, "Decline", "Can't move it there!")
+		end
+		return
+	end
+
+	-- ITEM #9: a MOVE is an invalidation too, not just a delete. The instance
+	-- survives, but every NPC that computed a path to its old position is now
+	-- walking to the wrong place -- and an employee bound to it as a station
+	-- needs to re-walk. StationManager already watches for this via its anchor
+	-- check; this covers the customers, which nothing was telling.
+	notifyObjectMoved(plot, obj)
+
+	returnOrphanedSurfaceTopObjects(player, plot)
+	savePlotForPlot(plot, player)
+end)
+
+-- StoreObject (move to inventory)
+ReplicatedStorage.RemoteEvents.StoreObject.OnServerEvent:Connect(function(player: Player, data: any)
+	local rateLimiter = cachedModules.RateLimiter
+	if rateLimiter and not rateLimiter.guard(player, "StoreObject", 10, 3) then return end
+
+	local objectId = data.ObjectId
+	if typeof(objectId) ~= "number" then return end
+
+	local plot = getActingPlot(player, data.TargetPlot)
+	if not assertCanBuild(player, plot) then return end
+
+	local obj = findObjectByBuildId(plot, objectId)
+	if not obj then return end
+
+	-- Walls behave like furniture now and can be stored just like anything
+	-- else. FloorRegion groups are the one exception -- storing a multi-tile
+	-- region as a single inventory item would lose its shape, so those still
+	-- can't be stored (only sold/deleted).
+	-- A multi-tile region or patch would lose its shape as a single inventory
+	-- item, so both grouped forms are sell-only, never storable.
+	local storeBuildType = obj:GetAttribute("BuildType")
+	if storeBuildType == "FloorModel" or storeBuildType == "SurfacePatch" then return end
+
+	-- Stored furniture belongs to the plot's owner, not to whoever stored it.
+	-- If the owner is offline there is no profile to store into, so refuse
+	-- rather than silently handing the item to the actor.
+	local owner = getPlotOwner(plot)
+	if not owner then return end
+
+	local inventory = getBuildInventory(owner)
+	inventory[obj.Name] = (inventory[obj.Name] or 0) + 1
+
+	local trophyService = cachedModules.MannequinTrophyService
+	if trophyService then
+		trophyService.onRemoved(plot, obj)
+	end
+
+	-- ITEM #9: same as DeleteObject -- warn the NPCs before it disappears.
+	notifyObjectRemoved(plot, obj)
+
+	obj.Parent = nil
+	returnOrphanedSurfaceTopObjects(player, plot)
+	savePlotForPlot(plot, player)
+	sendInventoryUpdate(owner)
+end)
+
+-- ToggleCollisions (toggle build object collision on/off) -- gated behind the
+-- No Collision gamepass. Ownership wasn't being checked at all before, so this
+-- was free for everyone; it also only touched objects that already existed at
+-- toggle time, so anything placed afterward silently ignored the setting.
+ReplicatedStorage.RemoteEvents.ToggleCollisions.OnServerEvent:Connect(function(player: Player)
+	local rateLimiter = cachedModules.RateLimiter
+	if rateLimiter and not rateLimiter.guard(player, "ToggleCollisions", 5, 2) then return end
+
+	if GamepassConfig.NoCollision and GamepassConfig.NoCollision > 0 then
+		local ok, owns = pcall(MarketplaceService.UserOwnsGamePassAsync, MarketplaceService, player.UserId, GamepassConfig.NoCollision)
+		if not ok or not owns then
+			MarketplaceService:PromptGamePassPurchase(player, GamepassConfig.NoCollision)
+			return
+		end
+	else
+		warn("[Server] GamepassConfig.NoCollision has no asset id set -- ToggleCollisions is disabled until it's configured.")
+		return
+	end
+
+	local plot = getActingPlot(player)
+	if not assertCanBuild(player, plot) then return end
+
+	collisionDisabled[player] = not collisionDisabled[player]
+	local disabled = collisionDisabled[player]
+
+	local buildObjects = plot:FindFirstChild("BuildObjects")
+	if buildObjects then
+		for _, obj in buildObjects:GetChildren() do
+			if obj:IsA("BasePart") then
+				obj.CanCollide = not disabled
+			elseif obj:IsA("Model") then
+				for _, part in obj:GetDescendants() do
+					if part:IsA("BasePart") then
+						part.CanCollide = not disabled
+					end
+				end
+			end
+		end
+	end
+
+	ReplicatedStorage.RemoteEvents.ToggleCollisions:FireClient(player, disabled)
+end)
+
+-- RequestInventory (send build inventory to client)
+ReplicatedStorage.RemoteEvents.RequestInventory.OnServerEvent:Connect(function(player: Player)
+	sendInventoryUpdate(player)
+end)
+
+-- ClearPlot ("Demolish my plot") -- the client's type-your-name textbox is a
+-- UX safety net against misclicks only. The only thing that actually matters
+-- here server-side is that the firing player owns the plot being wiped, which
+-- getActingPlot() already guarantees -- an exploiter firing this directly
+-- skips the confirmation, not the ownership check.
+ReplicatedStorage.RemoteEvents.ClearPlot.OnServerEvent:Connect(function(player: Player)
+	local rateLimiter = cachedModules.RateLimiter
+	if rateLimiter and not rateLimiter.guard(player, "ClearPlot", 2, 10) then return end
+
+	local plot = getActingPlot(player)
+	if not assertCanBuild(player, plot) then return end
+
+	-- Send customers on their way and clear employees first, same as entering
+	-- Build Mode -- otherwise their AI can end up referencing a rack/register
+	-- that's about to be destroyed out from under them.
+	local npcController = cachedModules.NPCController
+	if npcController and npcController.releasePlotNPCs then
+		npcController.releasePlotNPCs(plot)
+	end
+
+	-- ITEM #9: flag every object as invalidated before the wholesale clear, so
+	-- any NPC mid-walk toward one of them drops its reference on this frame
+	-- rather than arriving at a destroyed model.
+	do
+		local existing = plot:FindFirstChild("BuildObjects")
+		if existing then
+			for _, obj in existing:GetChildren() do
+				notifyObjectRemoved(plot, obj)
+			end
+		end
+	end
+
+	local employeeService = cachedModules.EmployeeService
+	if employeeService and employeeService.hideOwnedEmployees then
+		employeeService.hideOwnedEmployees(player)
+	end
+
+	local buildObjects = plot:FindFirstChild("BuildObjects")
+	if buildObjects then
+		buildObjects:ClearAllChildren()
+	end
+
+	savePlotForPlot(plot, player)
+
+	-- Employees have nowhere left to stand until the player re-places a
+	-- register, but respawning now (rather than leaving them hidden forever)
+	-- means they're ready to go the moment a new register goes down.
+	if employeeService and employeeService.respawnOwnedEmployees then
+		employeeService.respawnOwnedEmployees(player)
+	end
+
+	ReplicatedStorage.RemoteEvents.ClearPlot:FireClient(player)
+end)
+
+-- Cleanup on player leave
+Players.PlayerRemoving:Connect(function(player: Player)
+	collisionDisabled[player] = nil
+
+	-- trashStore entries are undo-delete records with no TTL -- without this
+	-- they accumulate forever across a long-running multi-player server as
+	-- people build/delete things and never hit undo, one leaked entry per
+	-- delete. Purge this player's on the way out.
+	for objectId, entry in pairs(trashStore) do
+		if entry.OwnerId == player.UserId then
+			trashStore[objectId] = nil
+		end
+	end
+end)
