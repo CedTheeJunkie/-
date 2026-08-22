@@ -1,0 +1,379 @@
+local SoundService = game:GetService("SoundService")
+local UserInputS = game:GetService("UserInputService")
+local RepS = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
+
+local shared = RepS.BuildMode
+local events = RepS.RemoteEvents
+
+local Settings = require(shared.Settings)
+local BuildHistory = require(shared.Modules.BuildHistory)
+
+local modules = script.Parent:WaitForChild("Modules")
+local PlacingService = require(modules.PlacingService)
+
+local General = require(shared.Utility.General)
+
+local player: Player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+local buildGui = playerGui:WaitForChild("Build")
+
+local ActingPlotResolver = require(game:GetService("ReplicatedStorage").Modules.ActingPlotResolver)
+
+local function getPlot(): Model?
+	return ActingPlotResolver.getActingPlot(player, true)
+end
+
+local toolbar = buildGui.ShopContainer:WaitForChild("Toolbar")
+local undoButton = toolbar:WaitForChild("Undo")
+local redoButton = toolbar:WaitForChild("Redo")
+local deleteButton = toolbar:WaitForChild("Delete")
+local gridButton = toolbar:WaitForChild("Grid")
+local gridSizeLabel = gridButton:WaitForChild("GridSizeLabel")
+local collisionButton = toolbar:WaitForChild("Collision")
+
+local cancelFrame = buildGui.CancelContainer:WaitForChild("CancelFrame")
+local cancelButton = cancelFrame:WaitForChild("CancelButton")
+
+-- ITEM #11: the stacks are NOT cached in locals here any more.
+--
+-- This file used to hold `local undoStack = BuildHistory.undoStack` and the
+-- same for redo. BuildHistory.pushUndo then did `BuildHistory.redoStack = {}`,
+-- replacing the table rather than emptying it -- so from the first undo onward
+-- the local and the module field were two different tables, and any read
+-- through the local saw a stack frozen in the past. BuildHistory now clears in
+-- place and everything here goes through its API, so there is no second
+-- reference left to fall out of step.
+
+local deleteMode = false
+local originalDeleteColor = deleteButton.ImageColor3
+
+local gridIndex = 3
+local function getCurrentGridSize()
+	return Settings.GridSizes[gridIndex]
+end
+local function updateGridLabel()
+	gridSizeLabel.Text = tostring(getCurrentGridSize())
+end
+
+Settings.GridUnit = getCurrentGridSize()
+updateGridLabel()
+player:SetAttribute("GridUnit", Settings.GridUnit)
+
+local function enterDeleteMode()
+	deleteMode = true
+	player:SetAttribute("DeleteMode", true)
+	deleteButton.ImageColor3 = Color3.fromRGB(255, 100, 100)
+	PlacingService.Cancel()
+end
+
+local function exitDeleteMode()
+	deleteMode = false
+	player:SetAttribute("DeleteMode", false)
+	deleteButton.ImageColor3 = originalDeleteColor
+end
+
+local sfxFolder = SoundService:FindFirstChild("SFX")
+local placeSoundTemplate = sfxFolder and sfxFolder:FindFirstChild("Object Placed")
+local deleteSoundTemplate = sfxFolder and sfxFolder:FindFirstChild("Object Deleted")
+
+local function playBuildSound(template)
+	if template and template.SoundId ~= "" then
+		local sound = template:Clone()
+		sound.Parent = SoundService
+		sound.Ended:Connect(function()
+			sound:Destroy()
+		end)
+		sound:Play()
+	end
+end
+
+events.PlacementResult.OnClientEvent:Connect(function(result)
+	-- ITEM #11: A DRAG STROKE IS ONE UNDO STEP.
+	--
+	-- The server stamps every placement produced by one drag with the same
+	-- BatchId, so the second and subsequent results fold into the entry the
+	-- first one created rather than each pushing their own. Undo then removes
+	-- the whole stroke in a single keypress.
+	--
+	-- Previously each tile pushed its own entry, so Ctrl+Z appeared to "skip":
+	-- it was consuming one tile per press while the player expected the stroke.
+	-- Worse for floor drags -- the server collapses those into a single part, so
+	-- most of the per-tile entries referred to BuildIds that never existed and
+	-- silently did nothing, walking the stack pointer back into unrelated
+	-- history.
+	if BuildHistory.appendToBatch(result.BatchId, result.ObjectId) then
+		return -- merged into the stroke already on the stack; no duplicate sound
+	end
+
+	BuildHistory.pushUndo({
+		action = result.BatchId and "BATCH_PLACE" or "Place",
+		batchId = result.BatchId,
+		objectName = result.ObjectName,
+		cframe = result.CF,
+		objectId = result.ObjectId,
+		objectIds = result.BatchId and { result.ObjectId } or nil,
+	})
+
+	-- Local-only thunk -- only the person placing hears it, not the whole server
+	playBuildSound(placeSoundTemplate)
+end)
+
+-- ITEM #11: VALID INSTANCE VERIFICATION.
+--
+-- An undo entry holds a BuildId, not a live reference, and plenty can happen to
+-- the object behind it between the action and the undo -- a co-builder with
+-- WorkBuild permission can delete it, the owner can Clear Plot, or the server
+-- can reject a placement the client optimistically recorded. Firing a remote
+-- for a BuildId that no longer resolves is not harmful on its own (the server
+-- looks it up and returns), but it silently consumes a stack entry, which is
+-- what makes undo feel like it "skips".
+--
+-- So an entry is checked against the live plot BEFORE it is spent. Ids that no
+-- longer exist are dropped from the entry; an entry with nothing left is
+-- discarded and the next one is tried instead.
+local function objectExists(plot: Model?, objectId: number?): boolean
+	if not plot or not objectId then return false end
+	local buildObjects = plot:FindFirstChild("BuildObjects")
+	if not buildObjects then return false end
+	for _, obj in ipairs(buildObjects:GetChildren()) do
+		if obj:GetAttribute("BuildId") == objectId then return true end
+	end
+	return false
+end
+
+-- Keeps only the ids in `action` that still resolve on `plot`. Returns the
+-- surviving list. For a Delete entry the objects are SUPPOSED to be gone, so
+-- existence is not required -- only the presence of an id to restore.
+local function liveIdsFor(action, plot: Model?, requireLive: boolean): { number }
+	local ids = BuildHistory.idsOf(action)
+	if not requireLive then return ids end
+
+	local live = {}
+	for _, id in ipairs(ids) do
+		if objectExists(plot, id) then table.insert(live, id) end
+	end
+	return live
+end
+
+undoButton.MouseButton1Click:Connect(function()
+	-- TargetPlot travels with every mutation (ITEM #10). The server re-verifies
+	-- it against CanPlayerBuild and falls back to its own resolution if it
+	-- disagrees, so this is a hint, never an authority.
+	local targetPlot = getPlot()
+
+	-- Loops rather than doing one pass: an entry whose objects have all been
+	-- destroyed by someone else is skipped and the NEXT one is undone, so one
+	-- press always performs one visible undo.
+	while BuildHistory.undoCount() > 0 do
+		local action = BuildHistory.popUndo()
+
+		if action.action == "Place" or action.action == "BATCH_PLACE" then
+			local ids = liveIdsFor(action, targetPlot, true)
+			if #ids > 0 then
+				for _, id in ipairs(ids) do
+					events.DeleteObject:FireServer({ObjectId = id, Reason = "undo", TargetPlot = targetPlot})
+				end
+				-- Redo must replay exactly what was undone, not what was originally
+				-- placed -- ids that had already been destroyed are not coming back.
+				action.objectIds = (#ids > 1) and ids or nil
+				action.objectId = ids[1]
+				playBuildSound(deleteSoundTemplate)
+				BuildHistory.pushRedo(action)
+				return
+			end
+			-- Nothing left of this stroke: drop it and try the next entry.
+
+		elseif action.action == "Delete" then
+			local ids = BuildHistory.idsOf(action)
+			if #ids > 0 then
+				for _, id in ipairs(ids) do
+					events.RestoreObject:FireServer({ObjectId = id, Reason = "undo", TargetPlot = targetPlot})
+				end
+				playBuildSound(placeSoundTemplate)
+				BuildHistory.pushRedo(action)
+				return
+			end
+
+		elseif action.action == "Move" then
+			if objectExists(targetPlot, action.objectId) then
+				events.MoveObject:FireServer({ObjectId = action.objectId, CF = action.oldCF, TargetPlot = targetPlot})
+				BuildHistory.pushRedo(action)
+				return
+			end
+		end
+	end
+end)
+
+redoButton.MouseButton1Click:Connect(function()
+	local targetPlot = getPlot()
+
+	while BuildHistory.redoCount() > 0 do
+		local action = BuildHistory.popRedo()
+
+		if action.action == "Place" or action.action == "BATCH_PLACE" then
+			local ids = BuildHistory.idsOf(action)
+			if #ids > 0 then
+				for _, id in ipairs(ids) do
+					events.RestoreObject:FireServer({ObjectId = id, Reason = "redo", TargetPlot = targetPlot})
+				end
+				playBuildSound(placeSoundTemplate)
+				-- pushUndo, NOT pushRedo: re-entering the undo stack is the whole
+				-- point of redo. It also clears the remaining redo branch, which is
+				-- correct -- see BuildHistory's note on branch invalidation.
+				table.insert(BuildHistory.undoStack, action)
+				return
+			end
+
+		elseif action.action == "Delete" then
+			local ids = liveIdsFor(action, targetPlot, true)
+			if #ids > 0 then
+				for _, id in ipairs(ids) do
+					events.DeleteObject:FireServer({ObjectId = id, Reason = "redo", TargetPlot = targetPlot})
+				end
+				playBuildSound(deleteSoundTemplate)
+				table.insert(BuildHistory.undoStack, action)
+				return
+			end
+
+		elseif action.action == "Move" then
+			if objectExists(targetPlot, action.objectId) then
+				events.MoveObject:FireServer({ObjectId = action.objectId, CF = action.newCF, TargetPlot = targetPlot})
+				table.insert(BuildHistory.undoStack, action)
+				return
+			end
+		end
+	end
+end)
+
+gridButton.MouseButton1Click:Connect(function()
+	gridIndex = gridIndex + 1
+	if gridIndex > #Settings.GridSizes then
+		gridIndex = 1
+	end
+	Settings.GridUnit = getCurrentGridSize()
+	updateGridLabel()
+	player:SetAttribute("GridUnit", Settings.GridUnit)
+end)
+
+deleteButton.MouseButton1Click:Connect(function()
+	if deleteMode then
+		exitDeleteMode()
+	else
+		enterDeleteMode()
+	end
+end)
+
+cancelButton.MouseButton1Click:Connect(function()
+	if deleteMode then
+		exitDeleteMode()
+	end
+	if player:GetAttribute("IsMovingBuild") then
+		player:SetAttribute("CancelMoveRequest", not player:GetAttribute("CancelMoveRequest"))
+	end
+
+	if PlacingService.GetPreview() then
+		PlacingService.Cancel()
+	end
+
+	-- PlacingService.Cancel() only clears the placement preview — it doesn't know
+	-- about the CancelContainer UI (that's normally hidden by Client.lua's
+	-- hidePlacementUI(), which only runs on the Escape key / gamepad B path).
+	-- Hide it here too so clicking this on-screen Cancel button actually makes
+	-- it go away.
+	buildGui.CancelContainer.Visible = false
+end)
+
+local function tryDeleteAtTarget()
+	if not deleteMode then return end
+
+	local plot: Model? = getPlot()
+	if not plot then return end
+
+	local buildObjects: Folder? = plot:FindFirstChild("BuildObjects")
+	if not buildObjects then return end
+
+	local raycastParams: RaycastParams = RaycastParams.new()
+	raycastParams.FilterType = Enum.RaycastFilterType.Include
+	raycastParams.FilterDescendantsInstances = { buildObjects }
+
+	local result: RaycastResult? = General.GetMouseResult(raycastParams)
+	if not result then return end
+
+	local hitInstance: Instance = result.Instance
+	local targetObject: Instance? = hitInstance
+
+	while targetObject and targetObject.Parent ~= buildObjects do
+		targetObject = targetObject.Parent
+	end
+
+	if not targetObject then return end
+
+	local objectId: number? = targetObject:GetAttribute("BuildId")
+	if not objectId then return end
+
+	local objectName: string = targetObject.Name
+	local cframe: CFrame = targetObject:GetPivot()
+
+	events.DeleteObject:FireServer({ObjectId = objectId, Reason = "delete", TargetPlot = plot})
+	playBuildSound(deleteSoundTemplate)
+
+	BuildHistory.pushUndo({
+		action = "Delete",
+		objectName = objectName,
+		cframe = cframe,
+		objectId = objectId,
+	})
+end
+
+UserInputS.InputBegan:Connect(function(input: InputObject, gameProcessed: boolean)
+	if gameProcessed then return end
+	if not deleteMode then return end
+
+	local isConfirmInput = input.UserInputType == Enum.UserInputType.MouseButton1
+		or input.UserInputType == Enum.UserInputType.Touch
+		or input.KeyCode == Enum.KeyCode.ButtonA
+
+	if not isConfirmInput then return end
+
+	tryDeleteAtTarget()
+end)
+
+local collisionDisabled = false
+local originalCollisionColor = collisionButton.ImageColor3
+collisionButton.MouseButton1Click:Connect(function()
+	local toggleCollisionsEvent = events:FindFirstChild("ToggleCollisions")
+	if toggleCollisionsEvent then
+		toggleCollisionsEvent:FireServer()
+	end
+end)
+
+events.ToggleCollisions.OnClientEvent:Connect(function(disabled: boolean)
+	collisionDisabled = disabled
+	-- This is the actual flag PlacingService/Validation checks to decide
+	-- whether an overlapping placement is allowed. It was never being set
+	-- anywhere, so the placement preview kept rejecting overlaps as "invalid"
+	-- no matter what this toggle (or gamepass ownership) said -- the button
+	-- would light up green but placement still behaved as if collision was on.
+	Settings.CanOverlapWithOtherParts = disabled
+	if disabled then
+		collisionButton.ImageColor3 = Color3.fromRGB(100, 200, 100)
+	else
+		collisionButton.ImageColor3 = originalCollisionColor
+	end
+end)
+
+buildGui:GetPropertyChangedSignal("Enabled"):Connect(function()
+	if not buildGui.Enabled then
+		exitDeleteMode()
+		-- ITEM #11: history does not survive the session.
+		--
+		-- Entries are BuildIds scoped to the plot that was being built on. Keeping
+		-- them across a close/reopen meant that a player who built on their own
+		-- plot, walked to a friend's and reopened Build Mode could press undo and
+		-- have it fire against the FRIEND's plot -- where the same BuildId either
+		-- matches nothing or, because ids come from one server-wide counter,
+		-- matches an unrelated object.
+		BuildHistory.reset()
+	end
+end)
