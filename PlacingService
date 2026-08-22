@@ -1,0 +1,1113 @@
+local UserInputS = game:GetService("UserInputService")
+local CollectionS = game:GetService("CollectionService")
+local RepS = game:GetService("ReplicatedStorage")
+local RunS = game:GetService("RunService")
+local Players = game:GetService("Players")
+
+local modules = script:FindFirstAncestor("Modules")
+local shared = RepS.BuildMode
+local events = RepS.RemoteEvents
+
+local libraries = RepS.Libraries
+
+local Utility = require(shared.Utility)
+local Settings = require(shared.Settings)
+local PlacementTypeConfig = require(RepS.Modules.PlacementTypeConfig)
+
+local Trove = require(libraries.Trove)
+local LemonSignal = require(libraries.LemonSignal)
+local ParamsBuilder = require(libraries.ParamsBuilder)
+
+local player: Player = Players.LocalPlayer
+local camera: Camera = workspace.CurrentCamera
+
+local Validation = require(shared.Modules.Validation)
+local ActingPlotResolver = require(RepS.Modules.ActingPlotResolver)
+
+local PlacingUtility = require(script.PlacingUtility)
+local ControlModule: { any } = require(player.PlayerScripts.PlayerModule)
+ControlModule = ControlModule:GetControls()
+
+local currentTrove: Trove = Trove.new()
+
+local placementStartedEvent: Signal<> = LemonSignal.new()
+local placementEndedEvent: Signal<> = LemonSignal.new()
+
+local renderedEvent: Signal<Instance, number, boolean> = LemonSignal.new()
+
+type Trove = Trove.Trove
+type Signal<T...> = LemonSignal.Signal<T...>
+type Params = ParamsBuilder.Params
+
+local PlacingService = {
+	Preview = nil,
+
+	CanPlace = false,
+	CanRender = true,
+	-- True only when the current placement is blocked SPECIFICALLY because it's
+	-- on land the player hasn't purchased yet (inside the full plot, outside
+	-- their PlotSize footprint) -- lets Client.lua show "Buy more land!"
+	-- instead of the generic can't-place message for that one case.
+	BlockedByOwnership = false,
+
+	PlacementTypeValid = true,
+
+	-- The outward normal of the wall face the current preview is mounted to, for
+	-- WallSurface / FloorWallAnchored items -- nil for everything else and
+	-- whenever the cursor isn't over a usable wall face.
+	--
+	-- This gets sent to the server with the placement. The server USED to
+	-- re-derive "which way is the wall" from the placed object's -LookVector,
+	-- which is wrong the moment the player rotates the item (the rotation is
+	-- baked into that CFrame), so the server's behind-me raycast fired sideways
+	-- and every rotated mirror/sconce/rack was rejected. The client is the only
+	-- side that actually knows which face was clicked, so it says so.
+	MountNormal = nil,
+
+	_WallNodes = {},
+	_WallLastPoint = nil,
+	_WallLastGridKey = nil,
+	_WallLastResult = nil,
+
+	GridUnit = nil,
+	RaycastParams = nil,
+
+	_Plot = nil,
+	_RotationCF = CFrame.identity,
+	_RotationYAngle = 0,
+
+	IsDragRotating = false,
+
+	-- Set by Client.lua while a multi-place drag is in progress.
+	IsMultiDragging = false,
+
+	-- { CFrame, Size } describing the exact grid EDGE a wall will occupy, or nil
+	-- when the current preview isn't a wall. Client.lua renders an outline from
+	-- this so the player can see the target before committing.
+	EdgeHighlight = nil,
+
+	PlacementStarted = placementStartedEvent,
+	PlacementEnded = placementEndedEvent,
+
+	Rendered = renderedEvent
+}
+
+-- ITEM #10 / #4: THE PLOT BEING BUILT ON, not "the plot I own".
+--
+-- This used to scan workspace.Plots for a plot whose USERID matched the local
+-- player and return that, full stop. Every consequence of Build Mode flowed
+-- from it: the raycast filter, the grid origin, the bounds check in Render, the
+-- wall-node registry. So a player granted build permission on a friend's store
+-- opened Build Mode and got their OWN plot's grid and bounds -- from across the
+-- map -- which meant the preview was permanently red, GetTargetCF raycast
+-- against a plot that wasn't under the cursor, and nothing could be placed.
+-- With no plot of their own yet (server full, plot unassigned) it returned nil
+-- and Build Mode simply refused to open at all.
+--
+-- ActingPlotResolver is the same resolution the SERVER performs in
+-- PlotService.resolveActingPlot, so the client's preview and the server's
+-- validation are now driven by one answer instead of two that disagree.
+--
+-- The `_Plot` cache is kept -- this is called several times per frame from
+-- Render/GetTargetCF -- but it is now invalidated whenever the player is no
+-- longer standing on the cached plot, so walking from your own store into a
+-- friend's re-targets rather than sticking to the first one seen.
+function PlacingService.GetPlot(): Model?
+	local cached: Model? = PlacingService._Plot
+	if cached and cached.Parent then
+		local character = player.Character
+		local hrp = character and character:FindFirstChild("HumanoidRootPart")
+		if hrp and ActingPlotResolver.isWithinPlotBounds(cached, hrp.Position) then
+			return cached
+		end
+	end
+
+	local resolved = ActingPlotResolver.getActingPlot(player, true)
+	PlacingService._Plot = resolved
+	return resolved
+end
+
+-- Explicitly drops the cache. Called when Build Mode opens/closes so a session
+-- can never inherit the plot from the previous one.
+function PlacingService.ClearPlotCache()
+	PlacingService._Plot = nil
+	PlacingService._WallNodes = {}
+	PlacingService._WallLastPoint = nil
+	PlacingService._WallLastGridKey = nil
+	PlacingService._WallLastResult = nil
+end
+
+function PlacingService.Rotate(axis: Vector3)
+	local rotationUnit: number = Settings.RotationUnit
+
+	PlacingService._RotationCF *= CFrame.fromAxisAngle(axis, math.rad(rotationUnit))
+
+	if axis == Vector3.yAxis then
+		PlacingService._RotationYAngle += math.rad(rotationUnit)
+	end
+
+	-- Clear anti-jitter cache so preview updates immediately on keypress
+	PlacingService._WallLastPoint = nil
+	PlacingService._WallLastGridKey = nil
+	PlacingService._WallLastResult = nil
+end
+
+function PlacingService.SetRotationY(angleRadians: number)
+	PlacingService._RotationYAngle = angleRadians
+	PlacingService._RotationCF = CFrame.fromAxisAngle(Vector3.yAxis, angleRadians)
+
+	-- Clear anti-jitter cache so preview updates immediately on keypress
+	PlacingService._WallLastPoint = nil
+	PlacingService._WallLastGridKey = nil
+	PlacingService._WallLastResult = nil
+end
+
+function PlacingService.GetRotationY(): number
+	return PlacingService._RotationYAngle
+end
+
+local function getPlaneHit(planeY: number): Vector3?
+	local mousePos: Vector2 = UserInputS:GetMouseLocation()
+	local ray: Ray = camera:ViewportPointToRay(mousePos.X, mousePos.Y)
+	local dirY: number = ray.Direction.Y
+	if math.abs(dirY) < 1e-4 then return nil end
+
+	local t: number = (planeY - ray.Origin.Y) / dirY
+	if t < 0 then return nil end
+
+	return ray.Origin + ray.Direction * t
+end
+
+-- (snapToNearestFloorEdge was removed here. It picked whichever floor-cell edge
+-- was nearest the CURSOR and returned an orientation to match, which is what
+-- made walls spin 90 degrees back and forth as the mouse moved. Orientation now
+-- comes from the player's rotation alone -- see the Wall branch of GetTargetCF.)
+
+local function isWallInstance(instance: Instance?): boolean
+	while instance do
+		if instance:GetAttribute("PlacementType") == PlacementTypeConfig.Types.Wall
+			or instance:GetAttribute("BuildType") == "Wall" then
+			return true
+		end
+		instance = instance.Parent
+		if instance == workspace then break end
+	end
+	return false
+end
+
+local WALL_SNAP_DISTANCE = 6 
+local WALL_DEADZONE = 0.5 
+
+-- ===== THE SHARED BUILDING GRID =====
+--
+-- Everything module-sized lands on ONE grid, anchored to the plot's own corner.
+-- Before this there were three grids that agreed on nothing:
+--   walls    -- 8 studs, measured from the WORLD origin
+--   floors   -- 1 stud, measured from the plot Base centre
+--   ceilings -- 1 stud, measured from the plot Base centre
+-- which is why roofs would never line up with walls, and why two 8x8 floor
+-- tiles placed side by side overlapped by 7 studs unless you happened to land
+-- exactly on a multiple of 8.
+-- Single source of truth, shared with GridVisualController so the drawn grid
+-- and the snap lattice can never drift apart again.
+local MODULE = Settings.BuildModule or 8 -- floor tile / standard wall length
+local WALL_END_GRID = MODULE / 2         -- 4; lets 8- and 12-long walls chain together
+
+-- How much closer (as a fraction of a cell) the opposite orientation has to be
+-- before a wall flips between running north-south and east-west. Purely an
+-- anti-flicker margin for the cell diagonal; 0 would restore raw nearest-edge.
+local EDGE_SWITCH_BIAS = 0.12
+
+-- Builds an upright, run-aligned reference frame from a wall slab AS IT
+-- CURRENTLY SITS, plus its true dimensions.
+--
+-- Computed live rather than baked as an attribute. An earlier version baked the
+-- pivot->slab transform in Edit, which was wrong at runtime: a Model's pivot is
+-- its WorldPivot property, and that is not guaranteed to survive replication
+-- identically -- doors ended up half a stud off the wall plane in Play while
+-- measuring perfectly in Edit. Deriving it from live geometry each frame cannot
+-- drift, and costs a handful of vector ops.
+local function canonicalSlabFrame(slab: BasePart): (CFrame, number, number, number)
+	local cf: CFrame = slab.CFrame
+	local axes = {
+		{ v = cf.RightVector, len = slab.Size.X },
+		{ v = cf.UpVector,    len = slab.Size.Y },
+		{ v = cf.LookVector,  len = slab.Size.Z },
+	}
+
+	-- Whichever local axis points most nearly straight up is the wall's height.
+	local upIdx, bestUp = 1, -1
+	for i, a in ipairs(axes) do
+		local d = math.abs(a.v.Y)
+		if d > bestUp then bestUp, upIdx = d, i end
+	end
+
+	-- Of the two horizontal axes, the longer is the run, the shorter the thickness.
+	local rem = {}
+	for i, a in ipairs(axes) do
+		if i ~= upIdx then rem[#rem + 1] = a end
+	end
+	local longAxis = (rem[1].len >= rem[2].len) and rem[1] or rem[2]
+	local thickAxis = (longAxis == rem[1]) and rem[2] or rem[1]
+
+	local longDir: Vector3 = Vector3.new(longAxis.v.X, 0, longAxis.v.Z)
+	if longDir.Magnitude < 1e-4 then longDir = Vector3.zAxis end
+	longDir = longDir.Unit
+	local rightDir: Vector3 = Vector3.yAxis:Cross(longDir).Unit
+
+	-- +Y up, +Z along the run, +X across the thickness.
+	-- Right/up only, so fromMatrix derives a proper rotation (determinant +1).
+	-- The old four-argument form built a reflection here too -- see the note in
+	-- wallMountFrame. The endpoints this frame produces are unchanged.
+	local frame: CFrame = CFrame.fromMatrix(cf.Position, longDir:Cross(Vector3.yAxis).Unit, Vector3.yAxis)
+	return frame, longAxis.len, thickAxis.len, axes[upIdx].len
+end
+
+-- Min corner of the plot on X/Z, used as the phase of the snap lattice.
+--
+-- Anchored to PLOTBOUNDS, not Base. This matters more than it looks: the grid
+-- the player actually SEES is a Texture applied to PlotBounds (see
+-- GridVisualController), and PlotBounds is the owned footprint -- front-anchored
+-- and resized on every land upgrade, so it is NOT concentric with Base. Base is
+-- 128x128 while PlotBounds starts at 64x64, which on a real plot put the two
+-- corners 31.45 studs apart on Z.
+--
+-- Anchoring the maths to Base while drawing the grid on PlotBounds meant the
+-- visible lines and the snap positions were a third of a cell out of phase --
+-- so items appeared to land "between" grid squares no matter how carefully you
+-- aimed. Both now derive from the same part, so a grid line IS a snap line.
+local function getGridOrigin(plot: Model?): Vector3
+	local anchorPart = plot and (plot:FindFirstChild("PlotBounds") or plot:FindFirstChild("Base"))
+	if not (anchorPart and anchorPart:IsA("BasePart")) then return Vector3.zero end
+	return Vector3.new(
+		anchorPart.Position.X - anchorPart.Size.X / 2,
+		0,
+		anchorPart.Position.Z - anchorPart.Size.Z / 2
+	)
+end
+
+-- Snaps `value` so that (value - origin - offset) is a whole number of `module`.
+-- `offset` shifts the lattice: pass module/2 to land on cell CENTRES, 0 to land
+-- on cell EDGES.
+local function snapToModule(value: number, origin: number, module: number, offset: number): number
+	local rel = value - origin - offset
+	return origin + offset + math.floor(rel / module + 0.5) * module
+end
+
+-- Dynamically finds wall axis (Z or X) and calculates accurate endpoint nodes + thickness
+local function computeWallNodes(cframe: CFrame, size: Vector3)
+	local isZLonger = size.Z >= size.X
+	local length = isZLonger and size.Z or size.X
+	local thickness = isZLonger and size.X or size.Z
+	local halfLength = length / 2
+
+	local offsetA = isZLonger and Vector3.new(0, 0, -halfLength) or Vector3.new(-halfLength, 0, 0)
+	local offsetB = isZLonger and Vector3.new(0, 0, halfLength) or Vector3.new(halfLength, 0, 0)
+
+	local nodeA = (cframe * CFrame.new(offsetA)).Position
+	local nodeB = (cframe * CFrame.new(offsetB)).Position
+
+	return nodeA, nodeB, thickness, isZLonger
+end
+
+function PlacingService.RefreshWallNodes()
+	PlacingService._WallNodes = {}
+
+	local plot: Model? = PlacingService.GetPlot()
+	local buildObjects: Instance? = plot and plot:FindFirstChild("BuildObjects")
+	if not buildObjects then return end
+
+	for _, obj in ipairs(buildObjects:GetChildren()) do
+		if obj:GetAttribute("BuildType") == "Wall" or obj:GetAttribute("PlacementType") == PlacementTypeConfig.Types.Wall then
+			local objCF: CFrame?, objSize: Vector3?
+			if obj:IsA("Model") then
+				objCF, objSize = obj:GetBoundingBox()
+			elseif obj:IsA("BasePart") then
+				objCF, objSize = obj.CFrame, obj.Size
+			end
+			if objCF and objSize then
+				local nodeA, nodeB, thickness, isZLonger = computeWallNodes(objCF, objSize)
+				table.insert(PlacingService._WallNodes, { pos = nodeA, cf = objCF, thickness = thickness, isZLonger = isZLonger })
+				table.insert(PlacingService._WallNodes, { pos = nodeB, cf = objCF, thickness = thickness, isZLonger = isZLonger })
+			end
+		end
+	end
+end
+
+function PlacingService.RegisterWallNode(cf: CFrame, size: Vector3)
+	local nodeA, nodeB, thickness, isZLonger = computeWallNodes(cf, size)
+	table.insert(PlacingService._WallNodes, { pos = nodeA, cf = cf, thickness = thickness, isZLonger = isZLonger })
+	table.insert(PlacingService._WallNodes, { pos = nodeB, cf = cf, thickness = thickness, isZLonger = isZLonger })
+end
+
+function PlacingService.GetTargetCF(): CFrame?
+	local gridUnitOverride: number? = PlacingService.GridUnit
+	local gridUnit: number = if gridUnitOverride then gridUnitOverride
+		else Settings.GridUnit
+
+	local raycastParams: RaycastParams = PlacingService.RaycastParams
+	local raycastResult: RaycastResult? = Utility.General.GetMouseResult(raycastParams)
+
+	if not (raycastResult and raycastResult.Instance) then return end
+
+	local hitInstance: Instance = raycastResult.Instance
+	local hitPos: Vector3 = raycastResult.Position
+
+	local hitInstanceCF: CFrame = hitInstance:GetPivot()
+	local hitInstancePos: Vector3 = hitInstanceCF.Position
+
+	local preview: Instance? = PlacingService.GetPreview()
+	if not preview then return end
+
+	local placementType: string = PlacementTypeConfig.Get(preview)
+	PlacingService.PlacementTypeValid = true
+	PlacingService.MountNormal = nil
+
+	local plot: Model? = PlacingService.GetPlot()
+	local floorHeight: number? = PlacementTypeConfig.GetFloorHeight(plot)
+
+	local _, previewSize: Vector3 = (function()
+		if preview:IsA("Model") then
+			local CF: CFrame, size: Vector3 = preview:GetBoundingBox()
+			return CF, size
+		else
+			local CF: CFrame, size: Vector3 = preview:GetPivot(), preview.Size
+			return CF, size
+		end
+	end)()
+
+	local rotationCF: CFrame = PlacingService._RotationCF
+
+	-- ===== MOUNTING ONTO A WALL FACE =====
+	--
+	-- Shared by WallSurface (mirrors, sconces -- free height) and
+	-- FloorWallAnchored (the flush wall rack -- stands on the floor but must back
+	-- onto a wall). Both need the same thing: find the wall face under the
+	-- cursor, work out which way it faces, and lay the item flat against it.
+	--
+	-- The face normal comes from the RAYCAST, not from the wall model's
+	-- LookVector as it used to. A wall has two faces; using the model's own
+	-- forward axis meant items mounted on the far side were rotated 180 degrees
+	-- and pushed INTO the wall instead of out of it, which is a large part of why
+	-- wall-mounted items never sat properly.
+	local function wallMountFrame(): (CFrame?, Vector3?, Vector3?)
+		if not isWallInstance(hitInstance) then return nil end
+
+		local normal: Vector3 = raycastResult.Normal
+		local outward: Vector3 = Vector3.new(normal.X, 0, normal.Z)
+		if outward.Magnitude < 1e-3 then
+			-- Cursor landed on the TOP or BOTTOM face of the wall, so the hit normal
+			-- carries no information about which side of the wall the player means.
+			--
+			-- This used to fall back to the hit model's own LookVector. That is not
+			-- the wall's facing: measured on this place's wall prefab the slab's
+			-- LookVector is (0,0,1) -- along the RUN -- while the actual outward face
+			-- is (1,0,0). So aiming at the top edge of a wall (easy to do with the
+			-- build camera looking down) mounted the item 90 degrees off, floating in
+			-- open air beside the wall, which then failed the behind-me check anyway.
+			-- Reporting "no wall face here" is honest: the preview goes red and the
+			-- player aims at the side of the wall they actually want.
+			return nil
+		end
+		outward = outward.Unit
+
+		local alongWall: Vector3 = Vector3.yAxis:Cross(outward).Unit
+
+		-- LookVector == outward, so the item faces out of the wall, into the room.
+		--
+		-- Built from RIGHT and UP only, letting fromMatrix derive the third axis.
+		-- This used to pass a fourth argument (-outward) alongside a right vector of
+		-- yAxis:Cross(outward), and those two disagree: the resulting matrix had
+		-- DETERMINANT -1, i.e. it was a mirror rather than a rotation.
+		--
+		-- Locally that reads back fine -- LookVector returns exactly what you put
+		-- in -- so the preview looked correct. But a CFrame is serialised to the
+		-- server as a quaternion, and a quaternion cannot represent a reflection,
+		-- so the wire encoding silently repaired it into the nearest proper
+		-- rotation: the same frame turned 180 degrees. That is the entire "it's
+		-- flush in the preview but spins round when I place it" bug, and it also
+		-- made the flush rack unplaceable, because the item arrived back-to-front
+		-- and the server's behind-me probe then pointed away from the wall.
+		--
+		-- Deriving the third axis guarantees determinant +1, so what the player
+		-- sees in the preview is exactly what the server receives.
+		local frame: CFrame = CFrame.fromMatrix(Vector3.zero, outward:Cross(Vector3.yAxis).Unit, Vector3.yAxis)
+		return frame, outward, alongWall
+	end
+
+	if placementType == PlacementTypeConfig.Types.WallSurface then
+		local frame: CFrame?, outward: Vector3?, alongWall: Vector3? = wallMountFrame()
+		if not (frame and outward and alongWall) then
+			PlacingService.PlacementTypeValid = false
+			return CFrame.new(hitPos) * rotationCF
+		end
+
+		local wallFinalRotation: CFrame = frame * rotationCF
+		PlacingService.MountNormal = outward
+
+		local wallRelativePos: Vector3 = hitPos - hitInstancePos
+		local wallTangentU: number = wallRelativePos:Dot(alongWall)
+		local wallRawHeight: number = wallRelativePos:Dot(Vector3.yAxis)
+
+		local step: number = PlacementTypeConfig.WallSurfaceHeightStep
+		local snappedHeight: number = math.floor(wallRawHeight / step + 0.5) * step
+		local snappedTangentU: number = PlacingUtility.SnapToGrid(wallTangentU, gridUnit, math.abs(previewSize.X))
+
+		-- Snap along and up the wall, but keep the OUTWARD component of the actual
+		-- hit point, so the anchor stays exactly on the face that was clicked.
+		local base: Vector3 = hitInstancePos + (Vector3.yAxis * snappedHeight) + (alongWall * snappedTangentU)
+		local wallPlanePoint: Vector3 = base + outward * ((hitPos - base):Dot(outward))
+
+		-- Push it out along the wall normal by its OWN depth, measured from the
+		-- pivot rather than assumed. The old maths used previewSize.Z / 2, which
+		-- silently assumed the pivot sat at the centre of the bounding box -- for
+		-- a mirror or sconce whose pivot is anywhere else that buried it in the
+		-- wall or floated it off the surface by the pivot's own offset.
+		return PlacementTypeConfig.SnapFlushToPlane(preview, wallFinalRotation, wallPlanePoint, outward, 0.02)
+	end
+
+	if placementType == PlacementTypeConfig.Types.FloorWallAnchored then
+		-- Backs onto a wall AND stands on the floor. Previously this type did no
+		-- snapping at all -- it went down the ordinary floor path and merely
+		-- raycast backwards afterwards to decide valid/invalid, so the player had
+		-- to eyeball the alignment and the item never actually sat against the
+		-- wall. Now it mounts to the wall face like a mirror, then drops to the
+		-- floor.
+		local frame: CFrame?, outward: Vector3?, alongWall: Vector3? = wallMountFrame()
+
+		if frame and outward and alongWall then
+			local anchorRotation: CFrame = frame * rotationCF
+			PlacingService.MountNormal = outward
+
+			local relative: Vector3 = hitPos - hitInstancePos
+			local tangent: number = relative:Dot(alongWall)
+			local snappedTangent: number = PlacingUtility.SnapToGrid(tangent, gridUnit, math.abs(previewSize.X))
+
+			local base: Vector3 = hitInstancePos + (alongWall * snappedTangent)
+			local planePoint: Vector3 = base + outward * ((hitPos - base):Dot(outward))
+
+			local flushCF: CFrame = PlacementTypeConfig.SnapFlushToPlane(preview, anchorRotation, planePoint, outward, 0.02)
+
+			if floorHeight then
+				flushCF = PlacementTypeConfig.SnapBottomTo(preview, flushCF, floorHeight)
+			end
+			return flushCF
+		end
+
+		-- Not over a wall: flag it and fall through to the ordinary floor path so
+		-- the player still sees a (red) preview where the cursor is.
+		PlacingService.PlacementTypeValid = false
+	end
+
+	if placementType == PlacementTypeConfig.Types.SurfaceTop then
+		-- Every valid placement surface, whether a single table top or one of five
+		-- shelf tiers, is a part named exactly "SurfaceZone" -- no _1/_2 suffixes.
+		-- Whichever specific SurfaceZone part the raycast is currently over is the
+		-- one used, so multi-tier furniture just works without any extra config.
+		if hitInstance.Name ~= "SurfaceZone" then
+			PlacingService.PlacementTypeValid = false
+			return CFrame.new(hitPos) * rotationCF
+		end
+
+		local zonePart: BasePart = hitInstance :: BasePart
+		local zoneCF: CFrame = zonePart.CFrame
+		local zoneSize: Vector3 = zonePart.Size
+
+		local zoneRight, zoneUp, zoneLook = zoneCF.RightVector, zoneCF.UpVector, zoneCF.LookVector
+		-- fromMatrix's fourth argument is -LookVector, so passing zoneLook directly
+		-- built a reflection (determinant -1) that the network would silently spin
+		-- 180 degrees. Negating it reproduces the zone's own rotation exactly.
+		local surfaceOrientation: CFrame = CFrame.fromMatrix(Vector3.zero, zoneRight, zoneUp, -zoneLook)
+		local surfaceFinalRotation: CFrame = surfaceOrientation * rotationCF
+
+		local zoneRelativePos: Vector3 = hitPos - zoneCF.Position
+		local tangentU: number = zoneRelativePos:Dot(zoneRight)
+		local tangentV: number = zoneRelativePos:Dot(zoneLook)
+
+		local rotatedSize: Vector3 = rotationCF:VectorToWorldSpace(previewSize)
+		local footprintX: number, footprintZ: number = math.abs(rotatedSize.X), math.abs(rotatedSize.Z)
+
+		local snappedU: number = PlacingUtility.SnapToGrid(tangentU, gridUnit, footprintX)
+		local snappedV: number = PlacingUtility.SnapToGrid(tangentV, gridUnit, footprintZ)
+
+
+		-- Clamp within the zone's own footprint so decorations can't hang off the
+		-- edge of the table/shelf. If the item is bigger than the zone itself,
+		-- just center it rather than producing an inverted (min > max) range.
+		local limitU: number = math.max((zoneSize.X - footprintX) / 2, 0)
+		local limitV: number = math.max((zoneSize.Z - footprintZ) / 2, 0)
+		local clampedU: number = math.clamp(snappedU, -limitU, limitU)
+		local clampedV: number = math.clamp(snappedV, -limitV, limitV)
+
+		-- The point on the shelf/table's top face this item will stand on...
+		local surfacePoint: Vector3 = zoneCF.Position
+			+ (zoneRight * clampedU)
+			+ (zoneLook * clampedV)
+			+ (zoneUp * (zoneSize.Y / 2))
+
+		-- ...and the pivot that puts its underside exactly there. Previously this
+		-- added previewSize.Y / 2, which only lands correctly for prefabs whose
+		-- pivot happens to be the centre of their bounding box.
+		return PlacementTypeConfig.SnapFlushToPlane(preview, surfaceFinalRotation, surfacePoint, zoneUp)
+	end
+
+	local upVector: Vector3 = Vector3.new(0, 1, 0)
+	local rightVector: Vector3 = Vector3.new(1, 0, 0)
+	local lookVector: Vector3 = Vector3.new(0, 0, 1)
+
+	-- See the note above: the fourth argument is -LookVector, not LookVector.
+	local surfaceCF: CFrame = CFrame.fromMatrix(Vector3.zero, rightVector, upVector, -lookVector)
+	local finalRotation: CFrame = surfaceCF * rotationCF
+
+	local rotatedSize: Vector3 = rotationCF:VectorToWorldSpace(previewSize)
+	local sizeX: number, sizeY: number, sizeZ: number = math.abs(rotatedSize.X), math.abs(rotatedSize.Y), math.abs(rotatedSize.Z)
+
+	if placementType == PlacementTypeConfig.Types.Wall then
+		-- ===== EDGE-BASED WALL PLACEMENT =====
+		--
+		-- A wall does not float on a point grid -- it OCCUPIES ONE EDGE of one
+		-- building cell. The cursor picks the nearest cell edge, and the wall's
+		-- orientation is derived from WHICH EDGE that is, not from a rotation the
+		-- player has to manage. Walls on adjoining edges therefore meet perfectly
+		-- by construction -- which is why this needs no magnet and no corner-flush
+		-- correction (both deleted below).
+		--
+		-- The rotate key collapses to a 180-degree FLIP, the only thing rotation
+		-- can meaningfully mean on an edge: which way a door faces.
+		local planeY: number = floorHeight or hitPos.Y
+		local planeHit: Vector3? = getPlaneHit(planeY)
+		local basePos: Vector3 = planeHit or hitPos
+		local queryPos: Vector3 = Vector3.new(basePos.X, planeY, basePos.Z)
+
+		local gridOrigin: Vector3 = getGridOrigin(plot)
+
+		-- Fractional cell coordinates of the cursor.
+		local fx: number = (queryPos.X - gridOrigin.X) / MODULE
+		local fz: number = (queryPos.Z - gridOrigin.Z) / MODULE
+		local cellI: number, cellJ: number = math.floor(fx), math.floor(fz)
+		local localX: number, localZ: number = fx - cellI, fz - cellJ
+
+		-- Distance, in cell fractions, to each of this cell's four edges.
+		local dWest, dEast = localX, 1 - localX
+		local dSouth, dNorth = localZ, 1 - localZ
+		local nearest: number = math.min(dWest, dEast, dSouth, dNorth)
+
+		-- Dimensions come from the model's baked SLAB attributes, never from
+		-- GetBoundingBox().
+		--
+		-- This was the actual cause of the gaps and the off-centre doors. A model's
+		-- oriented bounding box is aligned to its PIVOT, and the door models carry
+		-- extra geometry (leaf, frame, handles) that pushed their pivot into a
+		-- different orientation from the plain walls. So a Wall reported its length
+		-- on Z while a Basic Door reported the SAME length on X -- which flipped
+		-- longAxisIsZ, rotated every door 90 degrees relative to the walls beside
+		-- it, and shifted its depth by the thickness of the protruding door leaf
+		-- (Vault Door read 2.03 thick instead of 1.00). Reading the slab directly
+		-- makes every variant -- plain wall, window, single door, double door,
+		-- garage -- report identical geometry and sit on exactly the same plane.
+		local wallSlab: BasePart? = nil
+		do
+			local slabName = preview:GetAttribute("WallSlabName")
+			local found = slabName and preview:FindFirstChild(slabName, true)
+			if found and found:IsA("BasePart") then wallSlab = found end
+		end
+
+		local slabFrame: CFrame? = nil
+		local wallLength: number, wallHeight: number
+		if wallSlab then
+			local f, len, _thick, h = canonicalSlabFrame(wallSlab)
+			slabFrame, wallLength, wallHeight = f, len, h
+		else
+			wallLength = preview:GetAttribute("WallLength") or math.max(previewSize.X, previewSize.Z)
+			wallHeight = preview:GetAttribute("WallHeight") or previewSize.Y
+		end
+		if wallLength <= 0 then wallLength = MODULE end
+		local spanCells: number = math.max(1, math.floor(wallLength / MODULE + 0.5))
+		-- A wall only sits cleanly on the lattice if its length is a whole number
+		-- of cells. The 12-stud Long Wall is 1.5 cells and cannot -- it falls back
+		-- to half-cell steps so it at least still chains with itself.
+		local fitsCells: boolean = math.abs(wallLength - spanCells * MODULE) < 0.25
+
+		-- Nearest-edge alone flickers when the cursor tracks the cell DIAGONAL,
+		-- where a vertical and a horizontal edge are equidistant -- the wall would
+		-- snap between two orientations on sub-pixel mouse jitter. Hysteresis: once
+		-- an orientation is chosen, the other has to be clearly closer (by
+		-- EDGE_SWITCH_BIAS of a cell) before it wins.
+		local vertDist: number = math.min(dWest, dEast)
+		local horizDist: number = math.min(dSouth, dNorth)
+		local onVerticalEdge: boolean
+		if PlacingService._WallLastOnVertical == nil then
+			onVerticalEdge = vertDist <= horizDist
+		elseif PlacingService._WallLastOnVertical then
+			onVerticalEdge = not (horizDist < vertDist - EDGE_SWITCH_BIAS)
+		else
+			onVerticalEdge = (vertDist < horizDist - EDGE_SWITCH_BIAS)
+		end
+
+		local edgeX: number, edgeZ: number
+
+		if onVerticalEdge then
+			-- A north-south edge: the wall runs along Z.
+			local edgeI: number = (nearest == dWest) and cellI or (cellI + 1)
+			edgeX = gridOrigin.X + edgeI * MODULE
+			if spanCells % 2 == 1 then
+				edgeZ = gridOrigin.Z + (cellJ + 0.5) * MODULE
+			else
+				edgeZ = gridOrigin.Z + math.floor(fz + 0.5) * MODULE
+			end
+			if not fitsCells then
+				edgeZ = snapToModule(queryPos.Z, gridOrigin.Z, WALL_END_GRID, wallLength / 2)
+			end
+		else
+			-- An east-west edge: the wall runs along X.
+			local edgeJ: number = (nearest == dSouth) and cellJ or (cellJ + 1)
+			edgeZ = gridOrigin.Z + edgeJ * MODULE
+			if spanCells % 2 == 1 then
+				edgeX = gridOrigin.X + (cellI + 0.5) * MODULE
+			else
+				edgeX = gridOrigin.X + math.floor(fx + 0.5) * MODULE
+			end
+			if not fitsCells then
+				edgeX = snapToModule(queryPos.X, gridOrigin.X, WALL_END_GRID, wallLength / 2)
+			end
+		end
+
+		-- Keyed on the CHOSEN EDGE rather than the raw cursor, so the preview only
+		-- recomputes when you actually cross onto a different edge. That's what
+		-- makes it feel like it clicks into place instead of sliding around.
+		local gridKey: string = string.format("%d:%d:%s",
+			math.round(edgeX * 100), math.round(edgeZ * 100), tostring(onVerticalEdge))
+
+		if PlacingService._WallLastResult and gridKey == PlacingService._WallLastGridKey then
+			return PlacingService._WallLastResult
+		end
+
+		PlacingService._WallLastOnVertical = onVerticalEdge
+
+		local edgeRunYaw: number = onVerticalEdge and 0 or math.rad(90)
+
+		-- Player rotation reduced to the nearest half turn.
+		local flipYaw: number = math.floor(PlacingService._RotationYAngle / math.pi + 0.5) * math.pi
+
+		-- WHERE THE SLAB MUST END UP: centred on the edge, upright, long axis along
+		-- the run. WallAlignCF then converts that into where the model's PIVOT has
+		-- to go.
+		--
+		-- This indirection is the whole fix. Each model's pivot sits at a different
+		-- rotation and offset relative to its own wall slab -- plain walls and
+		-- windows happen to be aligned (yaw 0, no offset) but every DOOR is authored
+		-- 90 degrees round (yaw -90) and shifted by up to 0.29 studs. Positioning
+		-- the pivot directly, as this used to, therefore laid doors across the edge
+		-- instead of along it and pushed them off the wall plane. Driving the SLAB
+		-- and deriving the pivot from it makes every variant land identically,
+		-- whatever orientation the artist happened to build it in.
+		-- Transform from "where the slab should be" to "where the pivot must go".
+		local alignCF: CFrame = slabFrame and slabFrame:ToObjectSpace(preview:GetPivot()) or CFrame.identity
+
+		-- Height from the slab too, so a door whose frame overhangs doesn't sit
+		-- higher or lower than the wall next to it.
+		local finalOrientation: CFrame = CFrame.Angles(0, edgeRunYaw + flipYaw, 0)
+		local wallFinalPos: Vector3 = Vector3.new(edgeX, planeY + wallHeight / 2, edgeZ)
+
+		-- Hand the client the exact edge being targeted so it can outline it.
+		PlacingService.EdgeHighlight = {
+			CFrame = CFrame.new(edgeX, planeY + 0.08, edgeZ) * CFrame.Angles(0, edgeRunYaw, 0),
+			Size = Vector3.new(0.7, 0.16, fitsCells and (spanCells * MODULE) or wallLength),
+		}
+
+		-- (The magnetic endpoint snap and its corner-flush correction used to live
+		-- here. Both are obsolete under edge placement: walls on adjoining edges
+		-- already meet exactly, so there is nothing left to magnetise or correct.
+		-- The magnet was also a large part of what made placement feel
+		-- unpredictable -- it pulled the wall away from the cell you were pointing
+		-- at whenever some other wall's end happened to be within 6 studs.)
+		local DISABLED_MAGNET: {any} = {}
+		local myThickness: number = math.min(previewSize.X, previewSize.Z)
+		local myIsZLonger: boolean = previewSize.Z >= previewSize.X
+		local bestNode = nil
+		local bestDist: number = WALL_SNAP_DISTANCE
+		local bestEndpoint: Vector3? = nil
+
+		for _, node in ipairs(DISABLED_MAGNET) do
+			local distA: number = (Vector2.new(myNodeA.X, myNodeA.Z) - Vector2.new(node.pos.X, node.pos.Z)).Magnitude
+			if distA < bestDist then
+				bestDist = distA
+				bestNode = node
+				bestEndpoint = myNodeA
+			end
+			local distB: number = (Vector2.new(myNodeB.X, myNodeB.Z) - Vector2.new(node.pos.X, node.pos.Z)).Magnitude
+			if distB < bestDist then
+				bestDist = distB
+				bestNode = node
+				bestEndpoint = myNodeB
+			end
+		end
+
+		if bestNode and bestEndpoint then
+			local shift: Vector3 = bestNode.pos - bestEndpoint
+
+			-- Handle 90-degree corner flush alignment
+			local dot = math.abs(finalOrientation.LookVector:Dot(bestNode.cf.LookVector))
+			if dot < 0.5 then -- Walls are perpendicular
+				local targetThickness = bestNode.thickness or myThickness
+
+				-- The existing wall's true thickness/normal axis is LookVector
+				-- only when its long axis is local X (isZLonger == false). For
+				-- Z-long walls the spine IS the LookVector, so the normal axis
+				-- is actually RightVector. Using LookVector unconditionally
+				-- pushed the correction along the spine instead of across the
+				-- gap for that orientation, leaving it unfixed.
+				local outwardDir = bestNode.isZLonger and bestNode.cf.RightVector or bestNode.cf.LookVector
+
+				-- Push toward whichever face the new wall is actually
+				-- approaching from -- previously this was always "+", which
+				-- only happened to be correct for half of all corner
+				-- configurations and widened/misaligned the rest.
+				local sideSign = (bestEndpoint - bestNode.pos):Dot(outwardDir)
+				if sideSign < 0 then
+					outwardDir = -outwardDir
+				end
+
+				shift = shift + (outwardDir * (targetThickness / 2))
+
+				-- Also flush OUR OWN thickness face against the existing wall's
+				-- end point. Without this, only the existing wall's thickness was
+				-- ever accounted for, leaving a thin sliver-shaped notch uncovered
+				-- at the corner running the full height of the wall -- that's the
+				-- tall wedge-shaped gap seen up close.
+				local myNormalDir = myIsZLonger and finalOrientation.RightVector or finalOrientation.LookVector
+				local mySideSign = (queryPos - bestNode.pos):Dot(myNormalDir)
+				if mySideSign < 0 then
+					myNormalDir = -myNormalDir
+				end
+
+				shift = shift + (myNormalDir * (myThickness / 2))
+			end
+
+			wallFinalPos = wallFinalPos + shift
+		end
+
+		-- Slab pose -> pivot pose.
+		local result: CFrame = CFrame.new(wallFinalPos) * finalOrientation * alignCF
+
+		PlacingService._WallLastPoint = queryPos
+		PlacingService._WallLastGridKey = gridKey
+		PlacingService._WallLastResult = result
+
+		return result
+	end
+
+	local relativePos: Vector3 = hitPos - hitInstanceCF.Position
+
+	local height: number = relativePos:Dot(upVector)
+	local tangentU: number = relativePos:Dot(rightVector)
+	local tangentV: number = relativePos:Dot(lookVector)
+
+	-- Module-sized items (floor tiles, ceiling tiles, roof panels -- anything a
+	-- full cell or larger on both axes) snap to the SHARED plot grid so they
+	-- line up with walls and with each other. Small items (furniture, decor)
+	-- keep the fine Settings.GridUnit so a chair can still be nudged into place.
+	--
+	-- This is what makes roofs snap to walls: previously ceiling tiles snapped
+	-- every 1 stud relative to the plot Base CENTRE while walls snapped every 8
+	-- from the WORLD origin, so the two lattices shared neither spacing nor
+	-- origin and could not be made to line up by any amount of nudging.
+	local isModularTile: boolean = (sizeX >= MODULE - 0.1) and (sizeZ >= MODULE - 0.1)
+
+	local snappedTangentU: number, snappedTangentV: number
+	if isModularTile then
+		local gridOrigin: Vector3 = getGridOrigin(plot)
+		-- Cell CENTRES, so an 8x8 tile fills exactly one cell edge-to-edge.
+		local worldX: number = snapToModule(hitPos.X, gridOrigin.X, MODULE, MODULE / 2)
+		local worldZ: number = snapToModule(hitPos.Z, gridOrigin.Z, MODULE, MODULE / 2)
+		snappedTangentU = worldX - hitInstancePos.X
+		snappedTangentV = worldZ - hitInstancePos.Z
+	else
+		snappedTangentU = PlacingUtility.SnapToGrid(tangentU, gridUnit, sizeX)
+		snappedTangentV = PlacingUtility.SnapToGrid(tangentV, gridUnit, sizeZ)
+	end
+
+	local snappedPos: Vector3 = hitInstancePos + (upVector * height) + (rightVector * snappedTangentU) + (lookVector * snappedTangentV)
+	local offsetDistance: number = (
+		math.abs(finalRotation.RightVector:Dot(upVector)) * previewSize.X +
+			math.abs(finalRotation.UpVector:Dot(upVector)) * previewSize.Y +
+			math.abs(finalRotation.LookVector:Dot(upVector)) * previewSize.Z
+	) / 2
+
+	local finalPos: Vector3 = snappedPos + (upVector * offsetDistance)
+
+	local finalCF: CFrame = CFrame.new(finalPos) * finalRotation
+
+	if placementType == PlacementTypeConfig.Types.Ceiling then
+		local ceilingHeight: number? = PlacementTypeConfig.GetCeilingHeight(plot, Settings.CeilingSnapHeight)
+
+		if isModularTile then
+			-- Ceiling TILES and roof panels are the ceiling. They keep sitting on
+			-- the ceiling plane exactly as before -- deliberately untouched, so no
+			-- existing roof moves.
+			if ceilingHeight then
+				finalCF = CFrame.new(finalPos.X, ceilingHeight, finalPos.Z) * finalRotation
+			end
+		else
+			-- Ceiling FIXTURES (hanging lights, flush lights) hang from the ceiling.
+			--
+			-- If there IS a real ceiling piece overhead they hang from its actual
+			-- underside, so a light under a skylight sits against the glass rather
+			-- than at some abstract height. Where there is no ceiling piece they fall
+			-- back to the plot's ceiling plane and remain placeable.
+			--
+			-- Requiring a tile overhead was tried and removed: a store is mostly open
+			-- ceiling until very late in a build, so the requirement read as "hanging
+			-- lights are broken" -- red everywhere, with no in-game explanation of
+			-- what was missing. Hanging a light in an unroofed room is allowed.
+			local undersideY: number? = PlacementTypeConfig.FindCeilingUnderside(plot, finalPos.X, finalPos.Z)
+			local mountY: number? = if undersideY
+				then undersideY - PlacementTypeConfig.CeilingMountClearance
+				else ceilingHeight
+
+			if mountY then
+				finalCF = PlacementTypeConfig.SnapTopTo(preview, finalCF, mountY)
+			end
+		end
+	elseif floorHeight then
+		-- Sit the object's LOWEST point on the floor, whatever its pivot happens
+		-- to be. This one line is the sinking/floating fix: the old version put
+		-- the PIVOT at floorHeight + height/2, which is only the same thing for a
+		-- prefab whose pivot is dead centre. Across this catalogue that was wrong
+		-- by up to 2.5 studs (Flush Wall Rack sank; Self Checkout floated).
+		finalCF = PlacementTypeConfig.SnapBottomTo(preview, finalCF, floorHeight)
+	end
+
+	-- (The FloorWallAnchored backward-raycast check used to live here. It's gone
+	-- because the type now snaps to the wall face directly, higher up -- reaching
+	-- this point at all means the cursor wasn't over a wall, and
+	-- PlacementTypeValid has already been set false there. Re-running the raycast
+	-- here would overwrite that with a guess based on the un-snapped orientation.)
+
+	return finalCF
+end
+
+function PlacingService.Render(deltaTime: number): CFrame?	
+	local canRender: boolean = PlacingService.CanRender
+	local preview: Instance? = PlacingService.GetPreview()
+
+	if not (canRender and preview) then return end
+
+	local CF: CFrame = PlacingService._CF
+	local targetCF: CFrame? = PlacingService.GetTargetCF() or CF
+
+	if not targetCF then return end
+
+	local _, previewSize: Vector3 = (function()
+		if preview:IsA("Model") then
+			local CF: CFrame, size: Vector3 = preview:GetBoundingBox()
+			return CF, size
+		else
+			local CF: CFrame, size: Vector3 = preview:GetPivot(), preview.Size
+			return CF, size
+		end
+	end)()
+
+	preview:PivotTo(targetCF)
+	PlacingService._CF = targetCF
+
+	local plot: Model? = PlacingService.GetPlot()
+	local buildObjects: Instance? = plot and plot:FindFirstChild("BuildObjects")
+	local includeInstances: {Instance}? = buildObjects and { buildObjects } or nil
+
+	local previewPlacementType: string = PlacementTypeConfig.Get(preview)
+	local isWallPlacement: boolean = previewPlacementType == PlacementTypeConfig.Types.Wall
+
+	-- WHICH TYPES ARE ALLOWED TO OVERLAP A WALL.
+	--
+	-- Ceiling: roofs sit inside the top stud of the wall band, so closing a roof
+	-- against the walls is always an overlap.
+	--
+	-- WallSurface: mirrors, wall lights, neon signs and wall art are SNAPPED
+	-- FLUSH onto a wall by definition -- that is what the type means. The overlap
+	-- test uses workspace:GetPartsInPart, which reports coincident faces as an
+	-- intersection (the same quirk documented on
+	-- PlacementTypeConfig.CeilingMountClearance), so every wall-mounted item was
+	-- being rejected by the very wall it is supposed to hang on.
+	--
+	-- Ignoring walls here does NOT make these items free-floating: every
+	-- non-wall object still blocks normally, which is what stops two mirrors
+	-- landing on the same patch of wall. Items on OPPOSITE faces of one wall are
+	-- pushed out by half their own depth, so their boxes never meet -- "same
+	-- face" falls out of the geometry rather than needing a special case.
+	local ignoresWallOverlap: boolean = previewPlacementType == PlacementTypeConfig.Types.Ceiling
+		or previewPlacementType == PlacementTypeConfig.Types.WallSurface
+
+	-- ITEM #5: No-Collision passes the flag EXPLICITLY now rather than relying
+	-- on Validation reaching into Settings. Same value, but it means the client
+	-- preview and the server's check are fed by the same parameter, and the
+	-- server (whose Settings copy nobody sets) can supply its own per-player
+	-- state through the identical argument.
+	local allowOverlap: boolean = Settings.CanOverlapWithOtherParts == true
+	local hasValidPlacement: boolean = Validation.HasValidPlacement(preview, includeInstances, isWallPlacement, ignoresWallOverlap, allowOverlap)
+
+	PlacingService.BlockedByOwnership = false
+
+	-- WHY the placement is blocked, not just THAT it is. "This can't be placed
+	-- here!" was the only message for every possible cause, which tells a player
+	-- nothing about what to do differently -- move the item, buy land, or pick a
+	-- different surface are three very different fixes.
+	PlacingService.BlockedReason = if hasValidPlacement then nil else "Overlap"
+
+	-- The plot boundary clamp runs REGARDLESS of the No-Collision toggle. That
+	-- toggle relaxes object-vs-object overlap only; nothing lets an item leave
+	-- the plot it is being built on (ITEM #5).
+	if hasValidPlacement and plot then
+		local base = plot:FindFirstChild("Base")
+		if base and base:IsA("BasePart") then
+			local halfExtents = Vector3.new(base.Size.X / 2, base.Size.Y / 2 + 1000, base.Size.Z / 2)
+			local localPos = base.CFrame:PointToObjectSpace(targetCF.Position)
+			if math.abs(localPos.X) > halfExtents.X
+				or math.abs(localPos.Z) > halfExtents.Z then
+				hasValidPlacement = false
+				PlacingService.BlockedReason = "OutOfBounds"
+			else
+				-- Inside the full plot, but is it inside land the player's actually
+				-- bought? PlotBounds is kept resized/front-anchored by
+				-- PlotParcelService (server), and replicates like any other part,
+				-- so we check it directly instead of recomputing from PlotSize.
+				local bounds = plot:FindFirstChild("PlotBounds")
+				if bounds and bounds:IsA("BasePart") then
+					local boundsHalf = bounds.Size / 2
+					local boundsLocalPos = bounds.CFrame:PointToObjectSpace(targetCF.Position)
+					if math.abs(boundsLocalPos.X) > boundsHalf.X or math.abs(boundsLocalPos.Z) > boundsHalf.Z then
+						hasValidPlacement = false
+						PlacingService.BlockedByOwnership = true
+						PlacingService.BlockedReason = "Ownership"
+					end
+				end
+			end
+		end
+	end
+
+	PlacingService.CanPlace = hasValidPlacement and PlacingService.PlacementTypeValid
+
+	-- Overlap is fine but this item cannot mount on whatever is under the cursor
+	-- (a wall light aimed at open floor, a surface decoration aimed at nothing).
+	if hasValidPlacement and not PlacingService.PlacementTypeValid then
+		PlacingService.BlockedReason = "Surface"
+	end
+
+	local lerpSpeed: number = Settings.LerpSpeed
+	local alpha: number = 1 - math.exp(-lerpSpeed * deltaTime)
+
+	local visualCF: CFrame? = PlacingService._VisualCF
+	if not visualCF then
+		visualCF = targetCF
+
+		PlacingService._VisualCF = visualCF
+		PlacingService._PreviousVisualPos = visualCF.Position
+	else
+		visualCF = visualCF:Lerp(targetCF, alpha)
+		PlacingService._VisualCF = visualCF
+	end
+
+	local visualPos: Vector3 = visualCF.Position
+	local previousVisualPos: Vector3 = PlacingService._PreviousVisualPos
+
+	local visualCF: CFrame = CFrame.new(visualPos) * targetCF.Rotation
+	PlacingService._PreviousVisualPos = visualPos
+
+	preview:PivotTo(visualCF)
+	renderedEvent:Fire(preview, targetCF, hasValidPlacement)
+end
+
+function PlacingService.PreparePreview(instance: Instance)
+	local newPreview: Instance = instance:Clone()
+
+	PlacingService.Preview = newPreview
+	PlacingUtility.ModifyPreview(newPreview)
+
+	local tempFolder = workspace:FindFirstChild("Temp")
+	if not tempFolder then
+		tempFolder = Instance.new("Folder")
+		tempFolder.Name = "Temp"
+		tempFolder.Parent = workspace
+	end
+	newPreview.Parent = tempFolder
+
+	local targetCF: CFrame? = PlacingService.GetTargetCF()
+	if not targetCF then return end
+
+	newPreview:PivotTo(targetCF)
+end
+
+function PlacingService.GetPreview(): Instance?
+	local preview: Instance? = PlacingService.Preview
+
+	return preview
+end
+
+function PlacingService.SetPreview(instance: Instance)
+	PlacingService.Cancel()
+
+	local plot: Model? = PlacingService.GetPlot()
+	if not plot then
+		-- Reached when the player is standing somewhere they have no build rights
+		-- (the road, or a stranger's plot). BuildToggle blocks Build Mode from
+		-- opening in that state, so this is the belt-and-braces path.
+		warn("[PlacingService] No build-authorised plot resolved for this player -- cannot place objects")
+		return
+	end
+
+	PlacingService.RaycastParams = (function()
+		local raycastParams: RaycastParams = RaycastParams.new()
+		local params: Params = ParamsBuilder.new(raycastParams)
+
+		params:Include(plot)
+
+		return raycastParams
+	end)()
+
+	PlacingService.PreparePreview(instance)
+
+	if PlacementTypeConfig.Get(instance) == PlacementTypeConfig.Types.Wall then
+		PlacingService._WallLastPoint = nil
+		PlacingService._WallLastGridKey = nil
+		PlacingService._WallLastResult = nil
+		PlacingService.RefreshWallNodes()
+	end
+
+	currentTrove:Clean()
+	currentTrove:BindToRenderStep("Render", Enum.RenderPriority.Camera.Value, PlacingService.Render)
+
+	placementStartedEvent:Fire()
+end
+
+function PlacingService.Cancel()
+	local preview: Instance? = PlacingService.GetPreview()
+	if not preview then return end
+
+	currentTrove:Clean()
+
+	PlacingService.CanPlace = false
+
+	PlacingService.GridUnit = nil
+	PlacingService.RaycastParams = nil
+	PlacingService.MountNormal = nil
+
+	PlacingService._RotationCF = CFrame.identity
+	PlacingService._RotationYAngle = 0
+	PlacingService.IsDragRotating = false
+
+	PlacingService._VisualCF = nil
+	PlacingService._CF = nil
+
+	PlacingService._WallLastPoint = nil
+	PlacingService._WallLastGridKey = nil
+	PlacingService._WallLastResult = nil
+	PlacingService._WallLastOnVertical = nil
+	PlacingService.EdgeHighlight = nil
+
+	preview:Destroy()
+	PlacingService.Preview = nil
+
+	placementEndedEvent:Fire()
+end
+
+return PlacingService
