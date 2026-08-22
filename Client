@@ -1,0 +1,1410 @@
+local UserInputS = game:GetService("UserInputService")
+local RepS = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
+local ContextActionService = game:GetService("ContextActionService")
+local GuiService = game:GetService("GuiService")
+
+local modules = script.Parent.Modules
+local shared = RepS.BuildMode
+local events = RepS.RemoteEvents
+
+local libraries = RepS.Libraries
+
+local Settings = require(shared.Settings)
+
+local Trove = require(libraries.Trove)
+local LemonSignal = require(libraries.LemonSignal)
+
+local PlacingService = require(modules.PlacingService)
+local PlacementTypeConfig = require(RepS.Modules.PlacementTypeConfig)
+
+local player: Player = Players.LocalPlayer
+local Build: ScreenGui = player.PlayerGui:WaitForChild("Build")
+
+local notificationController = player:WaitForChild("PlayerScripts"):WaitForChild("NotificationController")
+local notifyEvent = notificationController:WaitForChild("Notify")
+-- One message for every possible cause tells the player nothing about what to do
+-- differently -- "move the item", "buy land" and "aim at a wall" are three
+-- unrelated fixes. PlacingService.BlockedReason says which one applies.
+local BLOCKED_MESSAGES = {
+	Overlap = "Not enough space!",
+	Ownership = "Buy more land!",
+	OutOfBounds = "That's outside your plot!",
+	Surface = "This can't go there!",
+}
+
+local function blockedMessage(): string
+	if PlacingService.BlockedByOwnership then
+		return BLOCKED_MESSAGES.Ownership
+	end
+	return BLOCKED_MESSAGES[PlacingService.BlockedReason] or "This can't be placed here!"
+end
+
+local function notifyCantPlace()
+	notifyEvent:Fire("Decline", blockedMessage())
+end
+
+local guiVisual: Folder = Build.Visual
+
+local previewHighlight: Highlight = guiVisual.PreviewHighlight
+
+local canPlaceColor: Color3 = Settings.CanPlaceColor
+local cannotPlaceColor: Color3 = Settings.CannotPlaceColor
+
+-- A billboard pinned to the preview, so the reason a placement is blocked shows
+-- up where the player is actually looking, and BEFORE they click rather than
+-- only after a rejected attempt.
+--
+-- Built in code rather than authored in Studio deliberately: a GUI restructure
+-- cannot silently delete or rename it out from under this script, which is
+-- exactly how the whole demolish-confirmation flow died when ClearPlotConfirm's
+-- frames were renamed.
+local blockedBillboard: BillboardGui = Instance.new("BillboardGui")
+blockedBillboard.Name = "PlacementBlockedBillboard"
+blockedBillboard.AlwaysOnTop = true
+blockedBillboard.Size = UDim2.fromOffset(220, 44)
+blockedBillboard.StudsOffsetWorldSpace = Vector3.new(0, 3, 0)
+blockedBillboard.Enabled = false
+blockedBillboard.Parent = Build
+
+local blockedLabel: TextLabel = Instance.new("TextLabel")
+blockedLabel.Size = UDim2.fromScale(1, 1)
+blockedLabel.BackgroundTransparency = 1
+blockedLabel.Font = Enum.Font.FredokaOne
+blockedLabel.TextScaled = true
+blockedLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+blockedLabel.TextStrokeTransparency = 0.35
+blockedLabel.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
+blockedLabel.Text = ""
+blockedLabel.Parent = blockedBillboard
+
+local function updateBlockedBillboard(preview: Instance?, canPlace: boolean)
+	if canPlace or not preview then
+		blockedBillboard.Enabled = false
+		blockedBillboard.Adornee = nil
+		return
+	end
+
+	-- Adornee must be a BasePart. A Model preview's PrimaryPart is often unset,
+	-- so fall back to any part rather than silently rendering nothing.
+	local adornee: BasePart? = nil
+	if preview:IsA("BasePart") then
+		adornee = preview
+	elseif preview:IsA("Model") then
+		adornee = preview.PrimaryPart or preview:FindFirstChildWhichIsA("BasePart", true)
+	end
+	if not adornee then
+		blockedBillboard.Enabled = false
+		return
+	end
+
+	blockedLabel.Text = blockedMessage()
+	blockedLabel.TextColor3 = cannotPlaceColor
+	blockedBillboard.Adornee = adornee
+	blockedBillboard.Enabled = true
+end
+
+local previewTrove: Trove = Trove.new()
+local renderedEvent: Signal<Instance, number, boolean> = PlacingService.Rendered
+
+type Trove = Trove.Trove
+type Signal<T...> = LemonSignal.Signal<T...>
+
+local cancelContainer: Frame = Build.CancelContainer
+local cancelFrame: Frame = cancelContainer.CancelFrame
+local mobileAccept: ImageButton = cancelFrame:WaitForChild("AcceptButton")
+local mobileRotate: ImageButton = cancelFrame:WaitForChild("RotateButton")
+local cancelItemLabel: TextLabel = cancelFrame:WaitForChild("TextLabel")
+local currentObjectName: string? = nil
+
+cancelContainer.Visible = false
+
+local PLACEMENT_GAMEPAD_ACTION = "BuildPlacementInput"
+
+local categories = {
+	{frame = Build.ShopContainer.Furniture, templateName = "BuildTemplate", assetFolder = "Furniture"},
+	{frame = Build.ShopContainer.Decorations, templateName = "BuildTemplate", assetFolder = "Decorations"},
+	{frame = Build.ShopContainer.Construction, templateName = "BuildTemplate", assetFolder = "Construction"},
+	{frame = Build.ShopContainer.Utility, templateName = "BuildTemplate", assetFolder = "Utility"},
+}
+
+local function setupViewport(viewportFrame: ViewportFrame, object: Instance)
+	local clone: Instance = object:Clone()
+
+	-- Keep the original rotation (only re-center position to the origin).
+	-- CFrame.new(Vector3.zero) used to reset rotation to identity too, which
+	-- happened to not matter for most items (they're already identity-rotated)
+	-- but made the fix below meaningless if we ever add a pre-rotated item.
+	local originalPivot = clone:GetPivot()
+	clone:PivotTo(originalPivot - originalPivot.Position)
+
+	for _, descendant in clone:GetDescendants() do
+		if descendant:IsA("BasePart") then
+			descendant.Anchored = true
+		end
+	end
+
+	clone.Parent = viewportFrame
+
+	local camera = Instance.new("Camera")
+	camera.Parent = viewportFrame
+	viewportFrame.CurrentCamera = camera
+
+	-- Placeable items (registers, racks, etc.) often carry invisible
+	-- functional parts -- queue markers, employee stand zones, interaction
+	-- volumes -- that are transparent and non-collidable but can stretch
+	-- several studs beyond the actual visible furniture. Including them in
+	-- the framing bounding box wrecks the preview zoom (e.g. cash registers
+	-- were reading ~27 studs wide because of a 5-point queue line, when the
+	-- visible register is only ~3-4 studs). Only frame on parts that are
+	-- actually visible.
+	local minBound, maxBound = nil, nil
+	for _, descendant in clone:GetDescendants() do
+		if descendant:IsA("BasePart") and descendant.Transparency < 1 then
+			local partCf, partSize = descendant.CFrame, descendant.Size
+			local corners = {
+				Vector3.new(-1, -1, -1), Vector3.new(1, -1, -1), Vector3.new(-1, 1, -1), Vector3.new(-1, -1, 1),
+				Vector3.new(1, 1, -1), Vector3.new(1, -1, 1), Vector3.new(-1, 1, 1), Vector3.new(1, 1, 1),
+			}
+			for _, corner in corners do
+				local worldCorner = partCf:PointToWorldSpace((partSize / 2) * corner)
+				minBound = minBound and minBound:Min(worldCorner) or worldCorner
+				maxBound = maxBound and maxBound:Max(worldCorner) or worldCorner
+			end
+		end
+	end
+
+	local center, size
+	if minBound and maxBound then
+		center = (minBound + maxBound) / 2
+		size = maxBound - minBound
+	else
+		-- Fallback: no visible parts found (shouldn't happen), use full bounding box.
+		local cf, boundSize = clone:GetBoundingBox()
+		center, size = cf.Position, boundSize
+	end
+
+	local maxDim = math.max(size.X, size.Y, size.Z)
+	local distance = maxDim * 1.5
+
+	-- Frame from the item's front (LookVector), not a hardcoded world-space
+	-- direction -- items conventionally face -Z, so a fixed +X/+Y/+Z camera
+	-- offset was always looking at the BACK of every item (couches, registers,
+	-- everything). Using the item's own orientation keeps this correct even
+	-- if a future item isn't identity-rotated.
+	local front = originalPivot.LookVector
+	local right = originalPivot.RightVector
+	local cameraPos = center + front * distance * 0.9 + right * distance * 0.6 + Vector3.new(0, distance * 0.6, 0)
+	camera.CFrame = CFrame.new(cameraPos, center)
+end
+
+local function createButton(template: TextButton, object: Instance, parent: Frame)
+	local newButton: TextButton = template:Clone()
+	newButton.Name = object.Name
+	newButton.Parent = parent
+
+	local nameLabel: TextLabel? = newButton:FindFirstChild("BuildNameLabel")
+	if nameLabel then
+		nameLabel.Text = object.Name
+	end
+
+	local coinPriceLabel: TextLabel? = newButton:FindFirstChild("CoinPriceLabel")
+	if coinPriceLabel then
+		local coinPrice = object:GetAttribute("CoinPrice")
+		if typeof(coinPrice) == "number" and coinPrice > 0 then
+			coinPriceLabel.Text = tostring(coinPrice)
+			coinPriceLabel.Visible = true
+		else
+			coinPriceLabel.Visible = false
+		end
+	end
+
+	local diamondPriceLabel: TextLabel? = newButton:FindFirstChild("DiamondPriceLabel")
+	if diamondPriceLabel then
+		local diamondPrice = object:GetAttribute("DiamondPrice")
+		if typeof(diamondPrice) == "number" and diamondPrice > 0 then
+			diamondPriceLabel.Text = tostring(diamondPrice)
+			diamondPriceLabel.Visible = true
+		else
+			diamondPriceLabel.Visible = false
+		end
+	end
+
+	local viewportFrame: ViewportFrame? = newButton:FindFirstChild("ViewportFrame")
+	if viewportFrame then
+		if object:GetAttribute("TextOnly") == true then
+			viewportFrame.Visible = false
+		else
+			setupViewport(viewportFrame, object)
+		end
+	end
+
+	return newButton
+end
+
+local function isFloorPlacement(): boolean
+	local preview = PlacingService.GetPreview()
+	if not preview then return false end
+	return preview:GetAttribute("IsFloor") == true
+		or string.find(string.lower(preview.Name), "floor") ~= nil
+end
+
+-- How many BaseParts an asset is made of. Only SINGLE-part tiles can go down
+-- the area-fill path, because the server collapses a whole drag into one
+-- stretched part -- there's nothing sensible to stretch if the asset is a
+-- multi-part model.
+local function countParts(instance: Instance): number
+	local n = instance:IsA("BasePart") and 1 or 0
+	for _, d in ipairs(instance:GetDescendants()) do
+		if d:IsA("BasePart") then n += 1 end
+	end
+	return n
+end
+
+-- Ceiling TILES drag-fill exactly like floors. A Skylight is also a ceiling
+-- item but is two parts (frame + glass), so it deliberately does NOT area-fill
+-- -- it stays on the discrete multi-place path where each copy survives intact.
+local function isCeilingTilePlacement(): boolean
+	local preview = PlacingService.GetPreview()
+	if not preview then return false end
+	if PlacementTypeConfig.Get(preview) ~= PlacementTypeConfig.Types.Ceiling then return false end
+	return countParts(preview) == 1
+end
+
+-- The single gate for "dragging paints a filled region" rather than rotating.
+local function isAreaFillPlacement(): boolean
+	return isFloorPlacement() or isCeilingTilePlacement()
+end
+
+-- The footprint one tile covers, used as the drag STEP.
+--
+-- This used to step by Settings.GridUnit (1 stud) while the tiles are 8x8,
+-- which meant a drag emitted one CFrame per STUD instead of per TILE. The
+-- server collapses them all into a single correctly-sized part either way, so
+-- it looked fine -- but the charge is per CFrame, so a 24x24 floor (16 tiles,
+-- 240 coins) was billing 625 cells = 9,375 coins. Stepping by the tile size
+-- makes the count mean what it says.
+local function getTileStep(): (number, number)
+	local preview = PlacingService.GetPreview()
+	local fallback = Settings.GridUnit or 1
+	if not preview then return fallback, fallback end
+
+	local size: Vector3
+	if preview:IsA("Model") then
+		local _, s = preview:GetBoundingBox()
+		size = s
+	else
+		size = preview.Size
+	end
+
+	local x = (size.X > 0.05) and size.X or fallback
+	local z = (size.Z > 0.05) and size.Z or fallback
+	return x, z
+end
+
+local isFloorAreaDragging = false
+local floorDragStartCF: CFrame? = nil
+local areaPreviewBox: Part? = nil
+local areaTileLabel: TextLabel? = nil
+local areaTileBillboard: BillboardGui? = nil
+
+local function getOrCreateAreaPreviewBox(): Part
+	if not areaPreviewBox or not areaPreviewBox.Parent then
+		areaPreviewBox = Instance.new("Part")
+		areaPreviewBox.Name = "AreaPlacementPreview"
+		areaPreviewBox.Anchored = true
+		areaPreviewBox.CanCollide = false
+		areaPreviewBox.CanQuery = false
+		areaPreviewBox.CanTouch = false
+		areaPreviewBox.Material = Enum.Material.ForceField
+		areaPreviewBox.Color = canPlaceColor
+		areaPreviewBox.Transparency = 0.5
+		areaPreviewBox.Parent = workspace
+
+		areaTileBillboard = Instance.new("BillboardGui")
+		areaTileBillboard.Name = "TileCountLabel"
+		areaTileBillboard.Size = UDim2.new(0, 100, 0, 28)
+		areaTileBillboard.StudsOffset = Vector3.new(0, 3, 0)
+		areaTileBillboard.AlwaysOnTop = true
+		areaTileBillboard.MaxDistance = 300
+		areaTileLabel = Instance.new("TextLabel")
+		areaTileLabel.Size = UDim2.new(1, 0, 1, 0)
+		areaTileLabel.BackgroundTransparency = 0.3
+		areaTileLabel.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+		areaTileLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+		areaTileLabel.TextScaled = true
+		areaTileLabel.Font = Enum.Font.GothamBold
+		areaTileLabel.Parent = areaTileBillboard
+		areaTileBillboard.Parent = areaPreviewBox
+	end
+	return areaPreviewBox
+end
+
+local function updateAreaPreviewBox(startCF: CFrame, endCF: CFrame, canPlace: boolean?)
+	local box = getOrCreateAreaPreviewBox()
+	local stepX, stepZ = getTileStep()
+
+	local minX, maxX = math.min(startCF.X, endCF.X), math.max(startCF.X, endCF.X)
+	local minZ, maxZ = math.min(startCF.Z, endCF.Z), math.max(startCF.Z, endCF.Z)
+
+	-- Sized off the TILE footprint, matching what the server actually builds.
+	-- Previously this added Settings.GridUnit (1) while the server added the
+	-- tile's real width (8), so the ghost box was 7 studs smaller than the floor
+	-- you ended up with.
+	box.Size = Vector3.new((maxX - minX) + stepX, 0.2, (maxZ - minZ) + stepZ)
+	box.CFrame = CFrame.new((minX + maxX) / 2, startCF.Y + 0.15, (minZ + maxZ) / 2)
+
+	-- Color-code based on validity (green for valid, red for invalid)
+	box.Color = (canPlace == false) and cannotPlaceColor or canPlaceColor
+
+	-- Update tile count display
+	local tilesX = math.floor((maxX - minX) / stepX + 0.5) + 1
+	local tilesZ = math.floor((maxZ - minZ) / stepZ + 0.5) + 1
+	if areaTileLabel then
+		areaTileLabel.Text = string.format("%d tiles", tilesX * tilesZ)
+	end
+end
+
+local function hideAreaPreviewBox()
+	if areaPreviewBox then
+		areaPreviewBox.Parent = nil
+	end
+end
+
+-- Builds one CFrame per grid cell spanning the rectangle between the drag's
+-- start and end points, all sharing the same rotation/height as the start
+-- (floor tiles are already Y-snapped flush to the plot floor by PlacingService).
+local function computeAreaCFrames(startCF: CFrame, endCF: CFrame): {CFrame}
+	local stepX, stepZ = getTileStep()
+	local rotationOnly = startCF - startCF.Position
+
+	local minX, maxX = math.min(startCF.X, endCF.X), math.max(startCF.X, endCF.X)
+	local minZ, maxZ = math.min(startCF.Z, endCF.Z), math.max(startCF.Z, endCF.Z)
+
+	-- One entry per TILE, not per stud -- this count is what the server charges
+	-- for, so it has to mean "tiles".
+	local cframes = {}
+	local x = minX
+	while x <= maxX + 0.01 do
+		local z = minZ
+		while z <= maxZ + 0.01 do
+			table.insert(cframes, CFrame.new(x, startCF.Y, z) * rotationOnly)
+			z += stepZ
+		end
+		x += stepX
+	end
+	return cframes
+end
+
+-- ===== MULTI-PLACE DRAG (rows / blocks of any item) =====
+--
+-- Floors already had drag-to-fill (above), but it's a special case: the server
+-- collapses a floor drag into ONE stretched part so the material UV stays
+-- continuous. Everything else -- racks, furniture, registers, mannequins --
+-- has to stay N discrete objects, each individually movable, sellable and
+-- interactable, so it needs its own path.
+--
+-- Why a toggle instead of "just drag":
+-- press-and-drag on a non-floor item ALREADY means free-rotate (the
+-- Bloxburg-style hold-to-spin). Overloading the same gesture would make it
+-- guesswork whether a drag was meant to turn one rack or lay down eight. The
+-- toggle keeps both gestures unambiguous, and gives touch players a visible
+-- affordance instead of a hidden gesture -- rotation stays available in
+-- multi mode via the Rotate button / R key.
+local MAX_MULTI_ITEMS = 60 -- hard cap; also mirrored server-side
+local MULTI_DRAG_THRESHOLD = 3 -- same responsiveness as the floor drag
+
+-- ===== MOBILE: MOVE MODE =====
+--
+-- On touch, releasing a finger anywhere on the world PLACES the item (see the
+-- InputEnded handler in startPlacing). That makes positioning and committing the
+-- same gesture: you cannot drag an item into place without also dropping it
+-- where your finger happens to leave the screen, and the preview is under your
+-- thumb the whole time so you cannot see what you are aiming at.
+--
+-- Move mode separates them. While it is on, dragging repositions the preview and
+-- lifting your finger does NOT commit -- placement happens only via the explicit
+-- Place button. Camera panning is suppressed for the duration so the world does
+-- not slide under the item being positioned (BuildCameraController honours
+-- PlacingService.IsMobileMoving, the same way it already honours
+-- PlacingService.IsDragRotating).
+--
+-- Declared here, alongside the other placement-mode state, because the input
+-- handlers inside startPlacing close over it long before the button that toggles
+-- it is built.
+local TOUCH_ENABLED: boolean = UserInputS.TouchEnabled
+local mobileMoveMode = false
+-- Forward-declared: hidePlacementUI (defined well above the mobile button code)
+-- has to be able to clear move mode when a placement ends, and a `local
+-- function` further down would be a different, invisible local to it.
+local setMoveMode: ((boolean) -> ())? = nil
+
+local multiModeEnabled = false
+-- Until the player touches the button, each item type gets the behaviour that
+-- already felt right for it: area-fill items (floors, ceiling tiles) drag by
+-- default because that's how they've always worked, and everything else starts
+-- in 1x so press-and-drag still free-rotates. The moment the button is pressed
+-- the player's choice takes over for the rest of the session.
+local multiModeUserChosen = false
+local isMultiDragging = false
+local multiDragStartCF: CFrame? = nil
+local multiGhosts: {Instance} = {}
+local multiGhostFolder: Folder? = nil
+local multiCountBillboard: BillboardGui? = nil
+local multiCountLabel: TextLabel? = nil
+local multiToggleButton: ImageButton? = nil
+local multiToggleLabel: TextLabel? = nil
+
+-- EVERY placement type can now be dragged. The earlier restriction to
+-- Floor/Ceiling was caution, not a technical limit -- the concerns turned out
+-- to be handled elsewhere:
+--
+--   Wall              -- magnetic endpoint snapping only positions the LIVE
+--                        preview; the fill extends from wherever that lands, so
+--                        the two don't fight. Stepping by the wall's own length
+--                        makes a dragged run butt together seamlessly.
+--   WallSurface       -- shelves/mirrors. The server already raycasts behind
+--   FloorWallAnchored    each one and rejects (and refunds) any that has no
+--                        wall behind it, so a row that runs off the end of a
+--                        wall self-trims instead of leaving floating items.
+--   SurfaceTop        -- decorations on furniture. Needed a new server-side
+--                        check (see PlaceMulti) that each copy actually lands
+--                        on a SurfaceZone, otherwise a row could float off the
+--                        end of a table.
+local function supportsMultiPlace(): boolean
+	local preview = PlacingService.GetPreview()
+	if not preview then return false end
+	-- Anything that area-fills (floors, ceiling tiles) has its own dedicated
+	-- drag path -- don't double-handle it here.
+	if isAreaFillPlacement() then return false end
+
+	-- Walls and doors are DELIBERATELY excluded. They use edge-based placement
+	-- now (one wall per grid edge, orientation taken from the edge), and a
+	-- rectangle fill has no sensible meaning on an edge lattice. Re-enabling is
+	-- a one-line change: delete this block.
+	if PlacementTypeConfig.Get(preview) == PlacementTypeConfig.Types.Wall then
+		return false
+	end
+
+	return true
+end
+
+-- Can this item be dragged at all, by either path?
+local function supportsAnyDrag(): boolean
+	return isAreaFillPlacement() or supportsMultiPlace()
+end
+
+-- The item's own footprint in ITS OWN local frame, rounded UP to a whole number
+-- of grid units. Two reasons it's rounded rather than used raw:
+--   * stepping by a raw footprint that isn't a grid multiple walks the row
+--     progressively off the grid PlacingService snaps single placements to, so
+--     item 6 no longer lines up with anything placed normally;
+--   * rounding up (never down) guarantees neighbours butt against each other
+--     instead of intersecting, which the server would reject as an overlap.
+local function getMultiStep(): (number, number)
+	local preview = PlacingService.GetPreview()
+	local gridUnit = PlacingService.GridUnit or Settings.GridUnit or 1
+	if not preview then return gridUnit, gridUnit end
+
+	local size: Vector3
+	if preview:IsA("Model") then
+		local _, boundsSize = preview:GetBoundingBox()
+		size = boundsSize
+	else
+		size = preview.Size
+	end
+
+	local function stepFor(axisSize: number): number
+		local units = math.max(1, math.ceil((math.abs(axisSize) - 0.01) / gridUnit))
+		return units * gridUnit
+	end
+
+	return stepFor(size.X), stepFor(size.Z)
+end
+
+-- One CFrame per slot in the rectangle spanned by the drag, laid out in the
+-- START item's local frame so a rotated row runs along the way the item is
+-- actually facing rather than along world X/Z.
+--
+-- A drag that stays within one step on an axis yields a count of 1 there, so a
+-- straight drag naturally produces a single line and a diagonal one fills the
+-- block -- no separate "line mode" needed.
+local function computeMultiCFrames(startCF: CFrame, endCF: CFrame): {CFrame}
+	local stepX, stepZ = getMultiStep()
+	local delta = startCF:VectorToObjectSpace(endCF.Position - startCF.Position)
+
+	local countX = math.floor(math.abs(delta.X) / stepX + 0.5) + 1
+	local countZ = math.floor(math.abs(delta.Z) / stepZ + 0.5) + 1
+
+	-- Clamp the LONGER axis first so a runaway diagonal degrades into a long
+	-- row rather than silently truncating into a lopsided block.
+	while countX * countZ > MAX_MULTI_ITEMS do
+		if countX >= countZ then countX -= 1 else countZ -= 1 end
+		if countX < 1 then countX = 1 break end
+		if countZ < 1 then countZ = 1 break end
+	end
+
+	local dirX = (delta.X >= 0) and 1 or -1
+	local dirZ = (delta.Z >= 0) and 1 or -1
+
+	local cframes = {}
+	for i = 0, countX - 1 do
+		for j = 0, countZ - 1 do
+			table.insert(cframes, startCF * CFrame.new(i * stepX * dirX, 0, j * stepZ * dirZ))
+		end
+	end
+	return cframes
+end
+
+local function getMultiGhostFolder(): Folder
+	if multiGhostFolder and multiGhostFolder.Parent then return multiGhostFolder end
+	local temp = workspace:FindFirstChild("Temp")
+	if not temp then
+		temp = Instance.new("Folder")
+		temp.Name = "Temp"
+		temp.Parent = workspace
+	end
+	multiGhostFolder = Instance.new("Folder")
+	multiGhostFolder.Name = "MultiPlaceGhosts"
+	multiGhostFolder.Parent = temp
+	return multiGhostFolder
+end
+
+local function clearMultiGhosts()
+	for _, ghost in ipairs(multiGhosts) do
+		if ghost and ghost.Parent then ghost:Destroy() end
+	end
+	table.clear(multiGhosts)
+
+	if multiCountBillboard then
+		multiCountBillboard:Destroy()
+		multiCountBillboard = nil
+		multiCountLabel = nil
+	end
+	if multiGhostFolder then
+		multiGhostFolder:Destroy()
+		multiGhostFolder = nil
+	end
+end
+
+local function updateMultiCountLabel(count: number, canPlace: boolean)
+	if count <= 1 then
+		if multiCountBillboard then multiCountBillboard.Enabled = false end
+		return
+	end
+
+	if not multiCountBillboard or not multiCountBillboard.Parent then
+		multiCountBillboard = Instance.new("BillboardGui")
+		multiCountBillboard.Name = "MultiPlaceCount"
+		multiCountBillboard.Size = UDim2.fromOffset(90, 30)
+		multiCountBillboard.StudsOffset = Vector3.new(0, 4, 0)
+		multiCountBillboard.AlwaysOnTop = true
+		multiCountBillboard.Parent = getMultiGhostFolder()
+
+		multiCountLabel = Instance.new("TextLabel")
+		multiCountLabel.Size = UDim2.fromScale(1, 1)
+		multiCountLabel.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+		multiCountLabel.BackgroundTransparency = 0.25
+		multiCountLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+		multiCountLabel.TextScaled = true
+		multiCountLabel.Font = Enum.Font.GothamBold
+		multiCountLabel.Parent = multiCountBillboard
+
+		local corner = Instance.new("UICorner")
+		corner.CornerRadius = UDim.new(0, 6)
+		corner.Parent = multiCountLabel
+	end
+
+	-- Adornee must be a BasePart. Several build prefabs are Models with no
+	-- PrimaryPart set, and assigning a Model here throws -- fall back to any
+	-- part in the model rather than trusting PrimaryPart to exist.
+	local preview = PlacingService.GetPreview()
+	local adornee: BasePart? = nil
+	if preview then
+		if preview:IsA("BasePart") then
+			adornee = preview
+		elseif preview:IsA("Model") then
+			adornee = preview.PrimaryPart or preview:FindFirstChildWhichIsA("BasePart", true)
+		end
+	end
+	if not adornee then
+		multiCountBillboard.Enabled = false
+		return
+	end
+
+	multiCountBillboard.Adornee = adornee
+	multiCountBillboard.Enabled = true
+	if multiCountLabel then
+		multiCountLabel.Text = string.format("x%d", count)
+		multiCountLabel.TextColor3 = canPlace and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(255, 130, 130)
+	end
+end
+
+-- Ghosts are recycled between frames rather than rebuilt: a drag updates on
+-- every mouse-move, and re-cloning a dozen furniture models at that rate is
+-- exactly the kind of thing that turns a smooth drag into a slideshow on a
+-- phone. Only a change in COUNT ever allocates.
+local function updateMultiGhosts(cframes: {CFrame}, canPlace: boolean)
+	local preview = PlacingService.GetPreview()
+	if not preview then return end
+
+	-- Index 1 is the live preview itself, which PlacingService is already
+	-- rendering -- ghosts cover slots 2..N.
+	local needed = math.max(#cframes - 1, 0)
+
+	for i = #multiGhosts, needed + 1, -1 do
+		local ghost = multiGhosts[i]
+		if ghost and ghost.Parent then ghost:Destroy() end
+		multiGhosts[i] = nil
+	end
+
+	for i = #multiGhosts + 1, needed do
+		local ghost = preview:Clone()
+		for _, descendant in ipairs(ghost:GetDescendants()) do
+			if descendant:IsA("BasePart") then
+				descendant.Anchored = true
+				descendant.CanCollide = false
+				descendant.CanQuery = false
+				descendant.CanTouch = false
+				descendant.Transparency = math.max(descendant.Transparency, 0.45)
+			elseif descendant:IsA("ProximityPrompt") then
+				descendant.Enabled = false
+			end
+		end
+		if ghost:IsA("BasePart") then
+			ghost.Anchored = true
+			ghost.CanCollide = false
+			ghost.CanQuery = false
+			ghost.CanTouch = false
+			ghost.Transparency = math.max(ghost.Transparency, 0.45)
+		end
+		ghost.Parent = getMultiGhostFolder()
+		multiGhosts[i] = ghost
+	end
+
+	for i = 1, needed do
+		local ghost = multiGhosts[i]
+		if ghost then ghost:PivotTo(cframes[i + 1]) end
+	end
+
+	updateMultiCountLabel(#cframes, canPlace)
+end
+
+local function setMultiModeEnabled(enabled: boolean, fromUser: boolean?)
+	multiModeEnabled = enabled
+	if fromUser then multiModeUserChosen = true end
+
+	if multiToggleButton then
+		multiToggleButton.BackgroundColor3 = enabled
+			and Color3.fromRGB(85, 200, 110)
+			or Color3.fromRGB(163, 162, 165)
+	end
+	if multiToggleLabel then
+		multiToggleLabel.Text = enabled and "MULTI" or "1x"
+	end
+
+	if not enabled then
+		isMultiDragging = false
+		PlacingService.IsMultiDragging = false
+		multiDragStartCF = nil
+		clearMultiGhosts()
+	end
+end
+
+-- Built at runtime rather than hand-placed in the GUI so the whole feature
+-- lives in one script. Cloned from RotateButton so it inherits the existing
+-- corner radius / gradient / sizing rather than looking bolted on, and dropped
+-- into the empty gap the layout already leaves between Rotate and Accept.
+local function ensureMultiToggleButton()
+	if multiToggleButton and multiToggleButton.Parent then return end
+
+	local clone = mobileRotate:Clone()
+	clone.Name = "MultiButton"
+	clone.Image = ""
+	clone.Size = UDim2.new(0.26, 0, 0.5069, 0)
+	clone.Position = UDim2.new(0.372, 0, -0.5486, 0)
+	clone.BackgroundColor3 = Color3.fromRGB(163, 162, 165)
+
+	-- The cloned aspect-ratio constraint would force this narrower slot back to
+	-- the square shape the icon buttons use, overflowing into its neighbours.
+	local aspect = clone:FindFirstChildOfClass("UIAspectRatioConstraint")
+	if aspect then aspect:Destroy() end
+	local innerIcon = clone:FindFirstChild("ImageLabel")
+	if innerIcon then innerIcon:Destroy() end
+
+	local label = Instance.new("TextLabel")
+	label.Name = "ModeLabel"
+	label.Size = UDim2.fromScale(1, 1)
+	label.BackgroundTransparency = 1
+	label.Font = Enum.Font.GothamBold
+	label.TextScaled = true
+	label.TextColor3 = Color3.fromRGB(255, 255, 255)
+	label.Text = "1x"
+	label.Parent = clone
+
+	local padding = Instance.new("UIPadding")
+	padding.PaddingTop = UDim.new(0, 4)
+	padding.PaddingBottom = UDim.new(0, 4)
+	padding.Parent = label
+
+	clone.Parent = cancelFrame
+	multiToggleButton = clone
+	multiToggleLabel = label
+
+	clone.Activated:Connect(function()
+		setMultiModeEnabled(not multiModeEnabled, true)
+	end)
+end
+
+-- ===== WALL EDGE HIGHLIGHT =====
+-- Walls occupy a specific grid EDGE, and without seeing which one you're
+-- targeting the snapping reads as arbitrary -- you only find out where the wall
+-- went after committing. PlacingService publishes the chosen edge each frame;
+-- this draws it.
+local edgeHighlightPart: Part? = nil
+
+local function getEdgeHighlightPart(): Part
+	if edgeHighlightPart and edgeHighlightPart.Parent then return edgeHighlightPart end
+
+	local temp = workspace:FindFirstChild("Temp")
+	if not temp then
+		temp = Instance.new("Folder")
+		temp.Name = "Temp"
+		temp.Parent = workspace
+	end
+
+	local part = Instance.new("Part")
+	part.Name = "WallEdgeHighlight"
+	part.Anchored = true
+	part.CanCollide = false
+	part.CanQuery = false
+	part.CanTouch = false
+	part.Material = Enum.Material.Neon
+	part.Transparency = 0.35
+	part.Parent = temp
+
+	edgeHighlightPart = part
+	return part
+end
+
+local function hideEdgeHighlight()
+	if edgeHighlightPart then
+		edgeHighlightPart:Destroy()
+		edgeHighlightPart = nil
+	end
+end
+
+local function updateEdgeHighlight(canPlace: boolean)
+	local edge = PlacingService.EdgeHighlight
+	if not edge then
+		hideEdgeHighlight()
+		return
+	end
+
+	local part = getEdgeHighlightPart()
+	part.Size = edge.Size
+	part.CFrame = edge.CFrame
+	part.Color = canPlace and canPlaceColor or cannotPlaceColor
+end
+
+local function hidePlacementUI()
+	previewHighlight.Adornee = nil
+	hideEdgeHighlight()
+	cancelContainer.Visible = false
+
+	-- Move mode must never survive the placement it belonged to: left on, it
+	-- would keep camera panning suppressed with no preview on screen and no
+	-- visible control explaining why the world had stopped responding.
+	if setMoveMode then setMoveMode(false) end
+	ContextActionService:UnbindAction(PLACEMENT_GAMEPAD_ACTION)
+	currentObjectName = nil
+
+	isMultiDragging = false
+	PlacingService.IsMultiDragging = false
+	multiDragStartCF = nil
+	clearMultiGhosts()
+end
+
+local function confirmPlacement()
+	local preview: Instance? = PlacingService.GetPreview()
+	if not preview or not currentObjectName then return end
+
+	local CF: CFrame = PlacingService._CF
+	local canPlace: boolean = PlacingService.CanPlace
+	if not canPlace or not CF then
+		notifyCantPlace()
+		return
+	end
+
+	preview:PivotTo(CF)
+	events.Place:FireServer({
+		ObjectName = currentObjectName,
+		CF = CF,
+		-- Which wall face this was mounted to. Only meaningful for WallSurface /
+		-- FloorWallAnchored items; nil otherwise and the server ignores it. The
+		-- server can't re-derive this from the CFrame once the player has rotated
+		-- the item, so it has to travel with the placement.
+		MountNormal = PlacingService.MountNormal,
+		-- ITEM #10: the plot this Build Mode session is bound to. The server
+		-- treats it strictly as a HINT -- it re-resolves and re-checks
+		-- CanPlayerBuild itself, and ignores this if the two disagree -- but
+		-- sending it means a guest builder's placement is attributed to the
+		-- friend's plot they actually opened Build Mode against, rather than
+		-- depending on the server's proximity resolution landing identically.
+		TargetPlot = PlacingService.GetPlot(),
+	})
+
+	-- Keep the snap-node registry current so a just-placed wall is immediately
+	-- a valid magnetic snap target for the next one (matters most when Ctrl is
+	-- held to place several in a row without re-selecting the tool). Registered
+	-- directly from the CFrame we just placed at -- NOT via RefreshWallNodes(),
+	-- which re-scans the replicated plot and would race the server round-trip,
+	-- missing the corner snap target if the next wall goes down quickly.
+	if PlacementTypeConfig.Get(preview) == PlacementTypeConfig.Types.Wall then
+		local _, previewSize: Vector3 = (function()
+			if preview:IsA("Model") then
+				local pCF: CFrame, size: Vector3 = preview:GetBoundingBox()
+				return pCF, size
+			else
+				local pCF: CFrame, size: Vector3 = preview:GetPivot(), preview.Size
+				return pCF, size
+			end
+		end)()
+		PlacingService.RegisterWallNode(CF, previewSize)
+	end
+
+	if UserInputS:IsKeyDown(Enum.KeyCode.LeftControl) then return end
+
+	previewTrove:Clean()
+	PlacingService.Cancel()
+	hidePlacementUI()
+end
+
+local function rotatePreview()
+	if not PlacingService.GetPreview() then return end
+	PlacingService.Rotate(Vector3.yAxis)
+end
+
+local function cancelPlacement()
+	if not PlacingService.GetPreview() then return end
+
+	previewTrove:Clean()
+	PlacingService.Cancel()
+	hidePlacementUI()
+end
+
+local function onGamepadPlacementInput(_, inputState, inputObject: InputObject)
+	if inputState ~= Enum.UserInputState.Begin then return end
+
+	if inputObject.KeyCode == Enum.KeyCode.ButtonA then
+		confirmPlacement()
+	elseif inputObject.KeyCode == Enum.KeyCode.ButtonY then
+		rotatePreview()
+	elseif inputObject.KeyCode == Enum.KeyCode.ButtonB then
+		cancelPlacement()
+	end
+
+	return Enum.ContextActionResult.Sink
+end
+
+local DRAG_ROTATE_THRESHOLD = 6 -- pixels of movement before a press counts as a rotate-drag instead of a tap
+local FLOOR_DRAG_THRESHOLD = 3 -- lower threshold so floor area dragging starts more responsively
+local DRAG_ROTATE_SENSITIVITY = 0.02 -- radians per pixel of horizontal drag
+
+local function getInputScreenPosition(inputObject: InputObject): Vector2
+	return Vector2.new(inputObject.Position.X, inputObject.Position.Y)
+end
+
+local function startPlacing(object: Instance)
+		previewTrove:Clean()
+	currentObjectName = object.Name
+
+	PlacingService.SetPreview(object)
+	previewTrove:Connect(renderedEvent, function(preview: Model, _, canPlace: boolean)
+		previewHighlight.Adornee = preview
+
+		if canPlace then previewHighlight.OutlineColor, previewHighlight.FillColor = canPlaceColor, canPlaceColor
+		else previewHighlight.OutlineColor, previewHighlight.FillColor = cannotPlaceColor, cannotPlaceColor end
+
+		-- renderedEvent reports the OVERLAP/bounds result. PlacingService.CanPlace
+		-- additionally factors in whether the item can mount on what's under the
+		-- cursor, and a "this can't go there" surface rejection deserves the same
+		-- on-screen explanation as a collision.
+		updateBlockedBillboard(preview, canPlace and PlacingService.CanPlace)
+
+		updateEdgeHighlight(canPlace)
+	end)
+	previewTrove:Add(hideEdgeHighlight)
+	-- Cleared whenever the preview goes away (placed, cancelled, tool switched),
+	-- otherwise the billboard would be left adorned to a destroyed preview.
+	previewTrove:Add(function()
+		updateBlockedBillboard(nil, true)
+	end)
+
+	-- Mouse click / touch tap confirms placement -- but holding and dragging
+	-- (mouse or touch) free-rotates the preview toward the drag instead,
+	-- matching Bloxburg's hold-to-rotate. A quick tap (little/no movement
+	-- before release) still confirms; a drag never does.
+	local isPressed = false
+	local isDragRotating = false
+	local pressStartPos = Vector2.zero
+	local dragStartYaw = 0
+
+	previewTrove:Connect(UserInputS.InputBegan, function(inputObject: InputObject, gameProcessedEvent: boolean)
+		if gameProcessedEvent then return end
+
+		local rotateY: Enum.KeyCode = Settings.RotateY
+		local cancel: Enum.KeyCode = Settings.Cancel
+
+		if inputObject.UserInputType == Enum.UserInputType.MouseButton1
+			or inputObject.UserInputType == Enum.UserInputType.Touch then
+			isPressed = true
+			isDragRotating = false
+			isFloorAreaDragging = false
+			isMultiDragging = false
+			pressStartPos = getInputScreenPosition(inputObject)
+			dragStartYaw = PlacingService.GetRotationY()
+			floorDragStartCF = PlacingService._CF
+			multiDragStartCF = PlacingService._CF
+		elseif inputObject.KeyCode == rotateY then
+			rotatePreview()
+		elseif inputObject.KeyCode == cancel then
+			cancelPlacement()
+		end
+	end)
+
+	previewTrove:Connect(UserInputS.InputChanged, function(inputObject: InputObject, gameProcessedEvent: boolean)
+		if not isPressed or gameProcessedEvent then return end
+		if inputObject.UserInputType ~= Enum.UserInputType.MouseMovement
+			and inputObject.UserInputType ~= Enum.UserInputType.Touch then return end
+
+		local currentPos = getInputScreenPosition(inputObject)
+		local delta = currentPos - pressStartPos
+
+		-- The MULTI button now gates BOTH drag paths, so "does dragging place
+		-- more than one?" has a single visible answer for every item rather than
+		-- floors silently behaving differently from everything else.
+		if multiModeEnabled and isAreaFillPlacement() then
+			-- Floors and ceiling tiles: dragging paints an area instead of rotating.
+			if not isFloorAreaDragging and delta.Magnitude > FLOOR_DRAG_THRESHOLD then
+				isFloorAreaDragging = true
+			end
+			if isFloorAreaDragging and floorDragStartCF and PlacingService._CF then
+				updateAreaPreviewBox(floorDragStartCF, PlacingService._CF, PlacingService.CanPlace)
+			end
+			return
+		end
+
+		-- Multi mode intercepts the drag before the rotate handler below, so the
+		-- same press can't be interpreted as both.
+		if multiModeEnabled and supportsMultiPlace() then
+			if not isMultiDragging and delta.Magnitude > MULTI_DRAG_THRESHOLD then
+				isMultiDragging = true
+				-- Suppress the wall magnet for the duration of the run.
+				PlacingService.IsMultiDragging = true
+			end
+			if isMultiDragging and multiDragStartCF and PlacingService._CF then
+				local cframes = computeMultiCFrames(multiDragStartCF, PlacingService._CF)
+				updateMultiGhosts(cframes, PlacingService.CanPlace)
+			end
+			return
+		end
+
+		-- MOVE MODE: the drag is repositioning the item, not turning it. The
+		-- preview already follows the finger for free -- PlacingService raycasts
+		-- from UserInputService:GetMouseLocation(), which on touch tracks the last
+		-- touch point -- so this only has to make sure the rotate gesture below
+		-- does not also claim the same drag.
+		if mobileMoveMode then return end
+
+		-- Area-fill items have no rotate-drag gesture (a floor tile looks the same
+		-- at every angle), so in 1x mode a drag on one simply does nothing.
+		if isAreaFillPlacement() then return end
+
+		if not isDragRotating and delta.Magnitude > DRAG_ROTATE_THRESHOLD then
+			isDragRotating = true
+			PlacingService.IsDragRotating = true
+		end
+
+		if isDragRotating then
+			PlacingService.SetRotationY(dragStartYaw + (delta.X * DRAG_ROTATE_SENSITIVITY))
+		end
+	end)
+
+	previewTrove:Connect(UserInputS.InputEnded, function(inputObject: InputObject)
+		if not isPressed then return end
+		if inputObject.UserInputType ~= Enum.UserInputType.MouseButton1
+			and inputObject.UserInputType ~= Enum.UserInputType.Touch then return end
+
+		local wasDragRotating = isDragRotating
+		local wasFloorAreaDragging = isFloorAreaDragging
+		local wasMultiDragging = isMultiDragging
+		isPressed = false
+		isDragRotating = false
+		isFloorAreaDragging = false
+		isMultiDragging = false
+		PlacingService.IsDragRotating = false
+		PlacingService.IsMultiDragging = false
+		hideAreaPreviewBox()
+
+		if wasMultiDragging and multiDragStartCF and PlacingService._CF and currentObjectName then
+			local cframes = computeMultiCFrames(multiDragStartCF, PlacingService._CF)
+			clearMultiGhosts()
+			multiDragStartCF = nil
+
+			if not PlacingService.CanPlace then
+				notifyCantPlace()
+				return
+			end
+
+			-- A one-slot "drag" is just a tap that wobbled -- route it through the
+			-- normal single-place path so it still respects Ctrl-to-keep-placing
+			-- and the PlacementResult round-trip.
+			if #cframes <= 1 then
+				confirmPlacement()
+				return
+			end
+
+			events.PlaceMulti:FireServer({
+				ObjectName = currentObjectName,
+				CFrames = cframes,
+				MountNormal = PlacingService.MountNormal,
+				TargetPlot = PlacingService.GetPlot(),
+			})
+
+			-- Same convention as single placement: hold Ctrl to stay in the tool
+			-- and lay down another run without re-picking the item.
+			if UserInputS:IsKeyDown(Enum.KeyCode.LeftControl) then return end
+
+			previewTrove:Clean()
+			PlacingService.Cancel()
+			hidePlacementUI()
+			return
+		end
+		multiDragStartCF = nil
+
+		if wasFloorAreaDragging and floorDragStartCF and PlacingService._CF and currentObjectName then
+			if not PlacingService.CanPlace then
+				notifyCantPlace()
+				floorDragStartCF = nil
+				return
+			end
+			local cframes = computeAreaCFrames(floorDragStartCF, PlacingService._CF)
+			events.PlaceArea:FireServer({
+				ObjectName = currentObjectName,
+				CFrames = cframes,
+				TargetPlot = PlacingService.GetPlot(),
+			})
+			floorDragStartCF = nil
+			return
+		end
+		floorDragStartCF = nil
+
+		-- THE PREMATURE-PLACEMENT GUARD. In move mode, lifting your finger means
+		-- "I have finished positioning", never "place it here". Committing is the
+		-- Place button's job and nothing else's.
+		if mobileMoveMode then return end
+
+		if not wasDragRotating then
+			confirmPlacement()
+		end
+	end)
+
+	cancelItemLabel.Text = object.Name
+	cancelContainer.Visible = true
+
+	-- Every placeable item can be dragged now, so the toggle is always shown.
+	-- Until the player presses it, each item starts in the mode that already
+	-- suited it (floors/ceilings drag, everything else rotates); after that,
+	-- their choice sticks across selections -- someone laying out a shop is
+	-- placing several runs back to back and shouldn't re-arm it every time.
+	ensureMultiToggleButton()
+	if multiToggleButton then
+		multiToggleButton.Visible = supportsAnyDrag()
+	end
+	if multiModeUserChosen then
+		setMultiModeEnabled(multiModeEnabled)
+	else
+		setMultiModeEnabled(isAreaFillPlacement())
+	end
+
+	ContextActionService:BindActionAtPriority(
+		PLACEMENT_GAMEPAD_ACTION,
+		onGamepadPlacementInput,
+		false,
+		Enum.ContextActionPriority.High.Value,
+		Enum.KeyCode.ButtonA,
+		Enum.KeyCode.ButtonY,
+		Enum.KeyCode.ButtonB
+	)
+end
+
+mobileAccept.Activated:Connect(confirmPlacement)
+mobileRotate.Activated:Connect(rotatePreview)
+
+-- ===== MOBILE: MOVE BUTTON =====
+--
+-- Built at runtime and cloned from RotateButton, the same approach the MULTI
+-- toggle above already uses: it inherits the existing corner radius, gradient
+-- and stroke rather than looking bolted on, and the whole feature stays in one
+-- script instead of depending on a hand-placed instance a GUI restructure can
+-- rename out from under it.
+--
+-- Sits as a full-width row ABOVE the icon row (which is itself positioned at
+-- negative Y relative to CancelFrame), so it is the closest control to the
+-- player's thumb and is a large target rather than a third squeezed icon.
+local moveButton: ImageButton? = nil
+local moveLabel: TextLabel? = nil
+
+setMoveMode = function(enabled: boolean)
+	mobileMoveMode = enabled
+	-- Read by BuildCameraController's TouchMoved handler to suppress one-finger
+	-- panning, so the world holds still while the item is being positioned.
+	PlacingService.IsMobileMoving = enabled
+
+	if moveButton then
+		moveButton.BackgroundColor3 = enabled
+			and Color3.fromRGB(85, 200, 110)
+			or Color3.fromRGB(163, 162, 165)
+	end
+	if moveLabel then
+		moveLabel.Text = enabled and "MOVING" or "MOVE"
+	end
+end
+
+local function ensureMoveButton()
+	if not TOUCH_ENABLED then return end
+	if moveButton and moveButton.Parent then return end
+
+	local clone = mobileRotate:Clone()
+	clone.Name = "MoveButton"
+	clone.Image = ""
+	clone.Size = UDim2.new(1, 0, 0.5069, 0)
+	clone.Position = UDim2.new(0, 0, -1.11, 0)
+	clone.BackgroundColor3 = Color3.fromRGB(163, 162, 165)
+
+	-- The cloned square aspect ratio would shrink this full-width row back to an
+	-- icon-sized square (the same trap ensureMultiToggleButton documents).
+	local aspect = clone:FindFirstChildOfClass("UIAspectRatioConstraint")
+	if aspect then aspect:Destroy() end
+	local innerIcon = clone:FindFirstChild("ImageLabel")
+	if innerIcon then innerIcon:Destroy() end
+
+	local label = Instance.new("TextLabel")
+	label.Name = "ModeLabel"
+	label.Size = UDim2.fromScale(1, 1)
+	label.BackgroundTransparency = 1
+	label.Font = Enum.Font.GothamBold
+	label.TextScaled = true
+	label.TextColor3 = Color3.fromRGB(255, 255, 255)
+	label.Text = "MOVE"
+	label.Parent = clone
+
+	local padding = Instance.new("UIPadding")
+	padding.PaddingTop = UDim.new(0, 4)
+	padding.PaddingBottom = UDim.new(0, 4)
+	padding.Parent = label
+
+	clone.Parent = cancelFrame
+	moveButton = clone
+	moveLabel = label
+
+	clone.Activated:Connect(function()
+		setMoveMode(not mobileMoveMode)
+	end)
+
+	setMoveMode(false)
+end
+
+-- ===== MOBILE: SAFE AREA =====
+--
+-- GetGuiInset returns the space the Roblox topbar and the device's own chrome
+-- (notch, rounded corners, home indicator) reserve. Build is a normal ScreenGui
+-- with IgnoreGuiInset = false, so the engine already keeps the TOP clear -- but
+-- nothing accounts for the bottom indicator, and on a short landscape phone the
+-- controls can end up under it.
+--
+-- Applied as an offset on top of the existing scale position, so the layout the
+-- artist authored is preserved on devices with no inset at all (every desktop),
+-- and only nudged where there is real chrome to clear.
+local function applySafeAreaPadding()
+	if not TOUCH_ENABLED then return end
+
+	-- Only the BOTTOM-RIGHT inset is applied. Build is a normal ScreenGui with
+	-- IgnoreGuiInset = false, so the engine has already shifted the whole GUI
+	-- space down past the topbar -- adding the top-left inset here as well would
+	-- double-count it and push the controls further down the screen for no
+	-- reason (measured: 29px of unwanted drop on a plain desktop viewport, where
+	-- there is no device chrome to clear at all).
+	--
+	-- Absolute offsets derived from the authored scale position, never additive,
+	-- so this is safe to re-run on every rotation and topbar change.
+	local _, bottomRight = GuiService:GetGuiInset()
+	local basePosition = cancelContainer.Position
+
+	cancelContainer.Position = UDim2.new(
+		basePosition.X.Scale,
+		-math.max(bottomRight.X, 0),
+		basePosition.Y.Scale,
+		-math.max(bottomRight.Y, 0)
+	)
+end
+
+ensureMoveButton()
+applySafeAreaPadding()
+
+-- The inset changes when the Roblox topbar shows/hides, and on a phone rotation
+-- the whole viewport flips -- so this is recomputed rather than measured once at
+-- join. Idempotent: it derives absolute offsets from the authored scale
+-- position, so repeated calls cannot drift the layout.
+if TOUCH_ENABLED then
+	GuiService:GetPropertyChangedSignal("TopbarInset"):Connect(applySafeAreaPadding)
+	local camera = workspace.CurrentCamera
+	if camera then
+		camera:GetPropertyChangedSignal("ViewportSize"):Connect(applySafeAreaPadding)
+	end
+end
+
+local function setupCategory(category)
+	local frame: ScrollingFrame = category.frame
+	local template: TextButton = frame:FindFirstChild(category.templateName)
+	if not template then return end
+
+	template.Parent = nil
+
+	local assetFolder: Folder? = shared.Assets:FindFirstChild(category.assetFolder)
+	if not assetFolder then return end
+
+	for _, object: Instance in assetFolder:GetChildren() do
+		assert(
+			object:IsA("BasePart") or object:IsA("Model"),
+			`{object} is not a valid object`
+		)
+
+		local newButton = createButton(template, object, frame)
+
+		newButton.MouseButton1Click:Connect(function()
+			startPlacing(object)
+		end)
+	end
+end
+
+for _, category in categories do
+	setupCategory(category)
+end
+
+-- ===== Category tabs =====
+-- The 4 tab buttons (Furniture/Decorations/Construction/Inventory) and their
+-- content frames existed in the GUI already, but nothing ever switched
+-- between them -- Furniture just happened to be left Visible=true by default
+-- and the other three were permanently hidden with no way to reach them.
+local tabButtons = Build.ShopContainer.Buttons
+-- Must list EVERY tab that has a button, because currentTabName -- which is
+-- what the search box filters -- is only updated for names present here.
+--
+-- Utility was missing, so clicking it left currentTabName pointing at whichever
+-- of the other tabs was selected last. CategorySwitcher still swapped the
+-- visible frame, so the Utility tab appeared normally and then the search box
+-- did nothing at all on it: every keystroke was filtering a frame the player
+-- couldn't see.
+local tabFrames = {
+	Furniture = Build.ShopContainer.Furniture,
+	Decorations = Build.ShopContainer.Decorations,
+	Construction = Build.ShopContainer.Construction,
+	Utility = Build.ShopContainer.Utility,
+	Inventory = Build.ShopContainer.Inventory,
+}
+
+local currentTabName = "Furniture"
+
+local function showTab(tabName: string)
+	if not tabFrames[tabName] then return end
+	currentTabName = tabName
+
+	for name, frame in pairs(tabFrames) do
+		frame.Visible = (name == tabName)
+	end
+
+	for _, button in ipairs(tabButtons:GetChildren()) do
+		if button:IsA("ImageButton") then
+			button.ImageTransparency = (button.Name == tabName) and 0 or 0.4
+		end
+	end
+end
+
+for _, button in ipairs(tabButtons:GetChildren()) do
+	if button:IsA("ImageButton") and tabFrames[button.Name] then
+		button.MouseButton1Click:Connect(function()
+			showTab(button.Name)
+		end)
+	end
+end
+
+showTab("Furniture")
+
+-- ===== Search =====
+-- The search bar is always visible now (no more toggle button) and live-
+-- filters whichever tab is currently open by item name -- switching tabs
+-- while searching clears the filter so it never looks like a tab is just
+-- missing items.
+local searchBar: Frame = Build.ShopContainer:WaitForChild("SearchBar")
+local searchTextBox: TextBox = searchBar:WaitForChild("SearchTextBox")
+local searchClearButton: TextButton = searchBar:WaitForChild("ClearButton")
+
+local function applySearchFilter(query: string)
+	local frame = tabFrames[currentTabName]
+	if not frame then return end
+
+	local loweredQuery = string.lower(query)
+
+	for _, child in ipairs(frame:GetChildren()) do
+		if child:IsA("GuiButton") and child.Name ~= "BuildTemplate" and child.Name ~= "InventoryTemplate" then
+			child.Visible = (loweredQuery == "") or (string.find(string.lower(child.Name), loweredQuery, 1, true) ~= nil)
+		end
+	end
+end
+
+searchTextBox:GetPropertyChangedSignal("Text"):Connect(function()
+	searchClearButton.Visible = searchTextBox.Text ~= ""
+	applySearchFilter(searchTextBox.Text)
+end)
+
+searchClearButton.Activated:Connect(function()
+	searchTextBox.Text = ""
+	searchTextBox:CaptureFocus()
+end)
+
+-- Switching tabs while a search is active would otherwise leave the new tab
+-- silently filtered by whatever was typed for the old one.
+for _, button in ipairs(tabButtons:GetChildren()) do
+	if button:IsA("ImageButton") and tabFrames[button.Name] then
+		button.MouseButton1Click:Connect(function()
+			if searchTextBox.Text ~= "" then
+				searchTextBox.Text = ""
+			end
+		end)
+	end
+end
+
+Build:GetPropertyChangedSignal("Enabled"):Connect(function()
+	if not Build.Enabled then
+		previewTrove:Clean()
+		PlacingService.Cancel()
+		hidePlacementUI()
+	end
+end)
+
+do
+	local function OnCharacterAdded(char: Model)
+		for _, child: Instance in char:GetChildren() do
+			if not child:IsA("BasePart") then continue end
+
+			child.CollisionGroup = "Player"
+		end
+	end
+
+	player.CharacterAdded:Connect(OnCharacterAdded)
+
+	local char: Model? = player.Character
+	if char then OnCharacterAdded(char) end
+end
